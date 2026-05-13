@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional
@@ -13,22 +13,41 @@ import numpy as np
 import tensorflow as tf
 
 
-def launch_tensorboard(log_dir: Path, port: int = 6006) -> subprocess.Popen[str]:
-    """Launch TensorBoard as a background process for live dashboard viewing."""
+def launch_tensorboard(log_dir: Path, port: int = 6006) -> Optional[subprocess.Popen]:
+    """Launch TensorBoard quietly in the background.
+
+    TensorBoard is started as a detached subprocess with stdout/stderr suppressed
+    so its reload and run-discovery INFO lines do not clutter the training terminal.
+    """
     command = [
-        sys.executable,
-        "-m",
-        "tensorboard.main",
+        "tensorboard",
         "--logdir",
         str(log_dir),
         "--port",
         str(port),
         "--reload_interval",
-        "2",
+        "10",
     ]
-    process = subprocess.Popen(command)
-    logging.info("TensorBoard launched at http://localhost:%d", port)
-    return process
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        logging.info("TensorBoard launched quietly at http://localhost:%d", port)
+        return process
+    except FileNotFoundError:
+        logging.error(
+            "Could not launch TensorBoard because the CLI was not found. "
+            "Install it with: python -m pip install tensorboard"
+        )
+        return None
 
 
 class LiveDashboardCallback(tf.keras.callbacks.Callback):

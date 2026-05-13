@@ -10,6 +10,25 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import tensorflow as tf
 
+# Defensive check: if TensorFlow is incorrectly installed (or a mismatched
+# package shadowing the name), accessing tf.data may fail with a confusing
+# AttributeError. Detect this early and raise a clear, actionable message.
+if not hasattr(tf, "data"):
+    try:
+        tf_version = getattr(tf, "__version__", "<unknown>")
+        tf_file = getattr(tf, "__file__", "<unknown path>")
+    except Exception:
+        tf_version = "<unknown>"
+        tf_file = "<unknown path>"
+    raise ImportError(
+        "TensorFlow appears to be improperly installed or incompatible with this environment. "
+        f"Detected object: tf (version={tf_version}, path={tf_file}).\n"
+        "Expected a full TensorFlow package exposing `tf.data`.\n"
+        "Common fixes: install a supported combination of Python + TensorFlow and numpy, "
+        "for example using Python 3.11 and: `python -m pip install 'tensorflow>=2.11,<2.14' 'numpy>=1.23,<1.25' tensorboard`.\n"
+        "If you have both `tensorflow` and `tensorflow-intel` installed, uninstall both and install just one.\n"
+    )
+
 
 AUTOTUNE = tf.data.AUTOTUNE
 
@@ -27,40 +46,69 @@ class MalariaDataset:
         dataset_root: str | Path,
         image_size: Tuple[int, int] = (224, 224),
         batch_size: int = 32,
-        val_split: float = 0.2,
+        test_split: float = 0.2,
         seed: int = 42,
         zip_path: Optional[str | Path] = None,
+        extract_zip: bool = False,
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.image_size = image_size
         self.batch_size = batch_size
-        self.val_split = val_split
+        self.test_split = test_split
         self.seed = seed
         self.zip_path = Path(zip_path) if zip_path else None
+        self.extract_zip = extract_zip
 
         self._class_dirs = self._prepare_dataset_layout()
 
     def create_datasets(self) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
-        """Build train and validation `tf.data.Dataset` pipelines."""
+        """Build train and test `tf.data.Dataset` pipelines."""
         samples = self._collect_labeled_files()
-        train_samples, val_samples = self._stratified_split(samples)
+        train_samples, test_samples = self._stratified_split(samples)
 
         train_ds = self._build_dataset(train_samples, training=True)
-        val_ds = self._build_dataset(val_samples, training=False)
+        test_ds = self._build_dataset(test_samples, training=False)
 
+        total_samples = len(samples)
         logging.info("Train samples: %d", len(train_samples))
-        logging.info("Validation samples: %d", len(val_samples))
-        return train_ds, val_ds
+        logging.info("Test samples: %d", len(test_samples))
+        logging.info("Total discovered samples: %d", total_samples)
+        if total_samples < 25000:
+            logging.warning(
+                "Discovered fewer images than expected for NIH malaria (~27k). "
+                "Check that `nih_data/cell_images/Parasitized` and "
+                "`nih_data/cell_images/Uninfected` are complete."
+            )
+        return train_ds, test_ds
 
     def _prepare_dataset_layout(self) -> Tuple[Path, Path]:
-        """Ensure class directories exist and extract ZIP if needed."""
+        """Ensure class directories exist. Optionally extract a provided ZIP.
+
+        By default this function assumes you have already extracted the NIH dataset
+        into `dataset_root` (e.g., `nih_data/`). If the dataset folders are not
+        present and `extract_zip` is True and a valid `zip_path` is provided, the
+        ZIP will be extracted. Otherwise an error will be raised so the user is
+        explicitly aware that the images must be present.
+        """
         class_dirs = self._resolve_class_dirs(self.dataset_root)
         if class_dirs:
+            logging.info(
+                "Using dataset folders: Parasitized=%s | Uninfected=%s",
+                class_dirs[0],
+                class_dirs[1],
+            )
             return class_dirs
+
+        if not self.extract_zip:
+            raise FileNotFoundError(
+                f"Dataset folders not found under {self.dataset_root}. "
+                "Set `extract_zip=True` and provide `zip_path` to extract automatically, "
+                "or unzip the archive manually into the dataset directory (e.g., nih_data/)."
+            )
 
         if self.zip_path is None or not self.zip_path.exists():
             raise FileNotFoundError(
-                "Dataset folders not found and ZIP path is missing or invalid."
+                "extract_zip=True was set but ZIP path is missing or invalid."
             )
 
         self.dataset_root.mkdir(parents=True, exist_ok=True)
@@ -73,12 +121,23 @@ class MalariaDataset:
             raise FileNotFoundError(
                 "Could not find 'Parasitized' and 'Uninfected' folders after extraction."
             )
+        logging.info(
+            "Using dataset folders after extraction: Parasitized=%s | Uninfected=%s",
+            class_dirs[0],
+            class_dirs[1],
+        )
         return class_dirs
 
     @staticmethod
     def _resolve_class_dirs(root: Path) -> Optional[Tuple[Path, Path]]:
         """Locate dataset class folders under a few known layouts."""
-        candidate_roots = [root, root / "cell_images", root / "archive" / "cell_images"]
+        candidate_roots = [
+            root,
+            root / "nih_data",
+            root / "cell_images",
+            root / "nih_data" / "cell_images",
+            root / "archive" / "cell_images",
+        ]
         for candidate in candidate_roots:
             parasitized = candidate / "Parasitized"
             uninfected = candidate / "Uninfected"
@@ -105,6 +164,11 @@ class MalariaDataset:
         samples = [(path, 1) for path in parasitized_files] + [
             (path, 0) for path in uninfected_files
         ]
+        logging.info(
+            "Class counts | Parasitized=%d | Uninfected=%d",
+            len(parasitized_files),
+            len(uninfected_files),
+        )
         if not samples:
             raise ValueError("No image files were found in the dataset directories.")
         return samples
@@ -112,7 +176,7 @@ class MalariaDataset:
     def _stratified_split(
         self, samples: Sequence[Tuple[str, int]]
     ) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
-        """Split samples by class distribution for stable validation metrics."""
+        """Split samples by class distribution for stable test metrics."""
         rng = random.Random(self.seed)
 
         by_label: dict[int, List[Tuple[str, int]]] = {0: [], 1: []}
@@ -120,17 +184,17 @@ class MalariaDataset:
             by_label[sample[1]].append(sample)
 
         train_samples: List[Tuple[str, int]] = []
-        val_samples: List[Tuple[str, int]] = []
+        test_samples: List[Tuple[str, int]] = []
 
         for label_samples in by_label.values():
             rng.shuffle(label_samples)
-            split_idx = int((1.0 - self.val_split) * len(label_samples))
+            split_idx = int((1.0 - self.test_split) * len(label_samples))
             train_samples.extend(label_samples[:split_idx])
-            val_samples.extend(label_samples[split_idx:])
+            test_samples.extend(label_samples[split_idx:])
 
         rng.shuffle(train_samples)
-        rng.shuffle(val_samples)
-        return train_samples, val_samples
+        rng.shuffle(test_samples)
+        return train_samples, test_samples
 
     def _build_dataset(
         self,

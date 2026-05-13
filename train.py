@@ -6,8 +6,11 @@ import argparse
 import datetime
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterator
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import tensorflow as tf
 
@@ -18,10 +21,10 @@ from utils.dashboard import LiveDashboardCallback, launch_tensorboard
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "data": {
-        "dataset_root": "data/nih_malaria",
+        "dataset_root": "nih_data",
         "zip_path": "archive.zip",
         "image_size": [224, 224],
-        "val_split": 0.2,
+        "test_split": 0.2,
         "batch_size": 64,
         "seed": 42,
     },
@@ -37,8 +40,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "paths": {
         "models_dir": "models",
         "logs_dir": "logs",
-        "best_model_name": "best_mobilenetv3_small.keras",
-        "last_model_name": "last_mobilenetv3_small.keras",
+        "best_model_name": "best_mobilenetv3_small.weights.h5",
+        "last_model_name": "last_mobilenetv3_small.h5",
         "tflite_name": "mobilenetv3_small_int8.tflite",
     },
     "export": {
@@ -100,14 +103,23 @@ def configure_logging(logs_dir: Path) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / "training.log"
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_path, encoding="utf-8"),
-        ],
-    )
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    logging.getLogger("tensorflow").setLevel(logging.ERROR)
+    logging.getLogger("absl").setLevel(logging.ERROR)
 
 
 def representative_dataset_generator(
@@ -173,11 +185,12 @@ def main() -> None:
         dataset_root=config["data"]["dataset_root"],
         image_size=tuple(config["data"]["image_size"]),
         batch_size=config["data"]["batch_size"],
-        val_split=config["data"]["val_split"],
+        test_split=config["data"]["test_split"],
         seed=config["data"]["seed"],
         zip_path=config["data"]["zip_path"],
+        extract_zip=False,
     )
-    train_ds, val_ds = dataset.create_datasets()
+    train_ds, test_ds = dataset.create_datasets()
 
     model = build_mobilenetv3_small(
         input_shape=(
@@ -206,6 +219,7 @@ def main() -> None:
             monitor="val_f1_score",
             mode="max",
             save_best_only=True,
+            save_weights_only=True,
             verbose=1,
         ),
         tf.keras.callbacks.EarlyStopping(
@@ -230,7 +244,7 @@ def main() -> None:
         callbacks.append(
             LiveDashboardCallback(
                 log_dir=tensorboard_run_dir,
-                validation_ds=val_ds,
+                validation_ds=test_ds,
                 prediction_threshold=config["dashboard"]["prediction_threshold"],
                 val_monitor_batches=config["dashboard"]["val_monitor_batches"],
             )
@@ -245,15 +259,15 @@ def main() -> None:
     )
     history = model.fit(
         train_ds,
-        validation_data=val_ds,
+        validation_data=test_ds,
         epochs=config["train"]["epochs"],
         callbacks=callbacks,
         verbose=1,
     )
     logging.info("Training finished after %d epochs", len(history.history["loss"]))
 
-    val_results = model.evaluate(val_ds, verbose=0, return_dict=True)
-    logging.info("Validation results: %s", val_results)
+    test_results = model.evaluate(test_ds, verbose=0, return_dict=True)
+    logging.info("Test results: %s", test_results)
 
     model.save(last_model_path)
     logging.info("Saved final checkpoint to %s", last_model_path)
