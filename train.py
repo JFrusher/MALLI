@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import json
 import logging
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import numpy as np
 import tensorflow as tf
 
 from data.data_loader import MalariaDataset
+from data.synthetic_data_loader import SyntheticFieldReadyDataset
 from models.model_factory import build_mobilenetv3_small, compile_binary_model
 from utils.dashboard import LiveDashboardCallback, launch_tensorboard
 
@@ -28,6 +30,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "test_split": 0.2,
         "batch_size": 64,
         "seed": 42,
+        "synthetic_dataset_root": "synthetic_field_ready",
+        "synthetic_labels_csv": "labels.csv",
     },
     "model": {
         "dropout_rate": 0.2,
@@ -49,6 +53,48 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,
         "representative_batches": 100,
     },
+    "stages": [
+        {
+            "name": "stage_1_nih_warmup",
+            "dataset": "nih",
+            "epochs": 1,
+            "learning_rate": 1e-3,
+            "train_backbone": False,
+            "early_stopping_patience": 1,
+        },
+        {
+            "name": "stage_2_nih_refine",
+            "dataset": "nih",
+            "epochs": 1,
+            "learning_rate": 2e-4,
+            "train_backbone": True,
+            "early_stopping_patience": 1,
+        },
+        {
+            "name": "stage_3_synth_warmup",
+            "dataset": "synthetic",
+            "epochs": 6,
+            "learning_rate": 1e-4,
+            "train_backbone": False,
+            "early_stopping_patience": 2,
+        },
+        {
+            "name": "stage_4_synth_refine",
+            "dataset": "synthetic",
+            "epochs": 6,
+            "learning_rate": 5e-5,
+            "train_backbone": True,
+            "early_stopping_patience": 2,
+        },
+        {
+            "name": "stage_5_synth_polish",
+            "dataset": "synthetic",
+            "epochs": 6,
+            "learning_rate": 1e-5,
+            "train_backbone": True,
+            "early_stopping_patience": 3,
+        },
+    ],
     "dashboard": {
         "enabled": True,
         "launch_tensorboard": False,
@@ -134,6 +180,175 @@ def representative_dataset_generator(
             yield [sample]
 
 
+def build_dataset_registry(config: Dict[str, Any]) -> Dict[str, tuple[tf.data.Dataset, tf.data.Dataset]]:
+    """Build the NIH and synthetic dataset splits once for the staged run."""
+
+    nih_dataset = MalariaDataset(
+        dataset_root=config["data"]["dataset_root"],
+        image_size=tuple(config["data"]["image_size"]),
+        batch_size=config["data"]["batch_size"],
+        test_split=config["data"]["test_split"],
+        seed=config["data"]["seed"],
+        zip_path=config["data"]["zip_path"],
+        extract_zip=False,
+    )
+    nih_train_ds, nih_val_ds = nih_dataset.create_datasets()
+
+    synthetic_dataset = SyntheticFieldReadyDataset(
+        dataset_root=config["data"]["synthetic_dataset_root"],
+        labels_csv=config["data"]["synthetic_labels_csv"],
+        image_size=tuple(config["data"]["image_size"]),
+        batch_size=config["data"]["batch_size"],
+        test_split=config["data"]["test_split"],
+        seed=config["data"]["seed"],
+    )
+    synthetic_train_ds, synthetic_val_ds = synthetic_dataset.create_datasets()
+
+    return {
+        "nih": (nih_train_ds, nih_val_ds),
+        "synthetic": (synthetic_train_ds, synthetic_val_ds),
+    }
+
+
+def run_training_stage(
+    stage: Dict[str, Any],
+    model: tf.keras.Model,
+    train_ds: tf.data.Dataset,
+    val_ds: tf.data.Dataset,
+    models_dir: Path,
+    stage_log_dir: Path,
+    logs_dir: Path,
+    export_monitor: str = "val_auc",
+) -> tf.keras.Model:
+    """Train one stage and return the best-restored model."""
+
+    stage_name = stage["name"]
+    stage_checkpoint_path = models_dir / f"{stage_name}.weights.h5"
+
+    callbacks = [
+        tf.keras.callbacks.TensorBoard(
+            log_dir=str(stage_log_dir),
+            histogram_freq=1,
+            write_graph=True,
+            write_images=False,
+            update_freq=1,
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(stage_checkpoint_path),
+            monitor=export_monitor,
+            mode="max",
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor=export_monitor,
+            mode="max",
+            patience=stage["early_stopping_patience"],
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor=export_monitor,
+            mode="max",
+            factor=0.2,
+            patience=max(1, stage["early_stopping_patience"] - 1),
+            min_lr=1e-6,
+            verbose=1,
+        ),
+        tf.keras.callbacks.CSVLogger(str(logs_dir / f"metrics_{stage_name}.csv")),
+    ]
+
+    if stage.get("dashboard", True):
+        callbacks.append(
+            LiveDashboardCallback(
+                log_dir=stage_log_dir,
+                validation_ds=val_ds,
+                prediction_threshold=0.5,
+                val_monitor_batches=20,
+            )
+        )
+
+    logging.info(
+        "Starting %s | dataset=%s | epochs=%d | lr=%s | train_backbone=%s",
+        stage_name,
+        stage["dataset"],
+        stage["epochs"],
+        stage["learning_rate"],
+        stage["train_backbone"],
+    )
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=stage["epochs"],
+        callbacks=callbacks,
+        verbose=1,
+    )
+    logging.info("Finished %s after %d epoch(s)", stage_name, len(history.history["loss"]))
+    return model
+
+
+def _safe_div(numerator: float, denominator: float) -> float:
+    if denominator == 0:
+        return 0.0
+    return float(numerator) / float(denominator)
+
+
+def calibrate_decision_threshold(
+    model: tf.keras.Model,
+    validation_ds: tf.data.Dataset,
+    output_path: Path,
+) -> dict[str, float]:
+    """Pick a deployment threshold that favors recall using the synthetic holdout."""
+
+    y_true_batches: list[np.ndarray] = []
+    y_prob_batches: list[np.ndarray] = []
+
+    for images, labels in validation_ds:
+        probabilities = model.predict(images, verbose=0).reshape(-1)
+        y_prob_batches.append(probabilities)
+        y_true_batches.append(labels.numpy().reshape(-1))
+
+    y_true = np.concatenate(y_true_batches).astype(np.int32)
+    y_prob = np.concatenate(y_prob_batches).astype(np.float32)
+
+    best = {
+        "threshold": 0.5,
+        "f2_score": -1.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "balanced_accuracy": 0.0,
+    }
+
+    for threshold in np.linspace(0.05, 0.95, 19):
+        y_pred = (y_prob >= threshold).astype(np.int32)
+
+        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+        tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+
+        precision = _safe_div(tp, tp + fp)
+        recall = _safe_div(tp, tp + fn)
+        specificity = _safe_div(tn, tn + fp)
+        balanced_accuracy = (recall + specificity) / 2.0
+        beta_sq = 4.0
+        f2_score = (1.0 + beta_sq) * precision * recall / (beta_sq * precision + recall + tf.keras.backend.epsilon())
+
+        if f2_score > best["f2_score"] or (np.isclose(f2_score, best["f2_score"]) and recall > best["recall"]):
+            best = {
+                "threshold": float(threshold),
+                "f2_score": float(f2_score),
+                "precision": float(precision),
+                "recall": float(recall),
+                "balanced_accuracy": float(balanced_accuracy),
+            }
+
+    output_path.write_text(json.dumps(best, indent=2), encoding="utf-8")
+    logging.info("Calibrated decision threshold saved to %s: %s", output_path, best)
+    return best
+
+
 def export_int8_tflite(
     model: tf.keras.Model,
     train_ds: tf.data.Dataset,
@@ -182,93 +397,65 @@ def main() -> None:
 
     tf.random.set_seed(config["data"]["seed"])
 
-    dataset = MalariaDataset(
-        dataset_root=config["data"]["dataset_root"],
-        image_size=tuple(config["data"]["image_size"]),
-        batch_size=config["data"]["batch_size"],
-        test_split=config["data"]["test_split"],
-        seed=config["data"]["seed"],
-        zip_path=config["data"]["zip_path"],
-        extract_zip=False,
-    )
-    train_ds, test_ds = dataset.create_datasets()
-
-    model = build_mobilenetv3_small(
-        input_shape=(
-            config["data"]["image_size"][0],
-            config["data"]["image_size"][1],
-            3,
-        ),
-        dropout_rate=config["model"]["dropout_rate"],
-        train_backbone=config["model"]["train_backbone"],
-    )
-    model = compile_binary_model(model, learning_rate=config["train"]["learning_rate"])
+    datasets = build_dataset_registry(config)
 
     best_model_path = models_dir / config["paths"]["best_model_name"]
     last_model_path = models_dir / config["paths"]["last_model_name"]
 
-    callbacks = [
-        tf.keras.callbacks.TensorBoard(
-            log_dir=str(tensorboard_run_dir),
-            histogram_freq=config["dashboard"]["histogram_freq"],
-            write_graph=True,
-            write_images=True,
-            update_freq=config["dashboard"]["update_freq"],
-        ),
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(best_model_path),
-            monitor="val_auc",
-            mode="max",
-            save_best_only=True,
-            save_weights_only=True,
-            verbose=1,
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_auc",
-            mode="max",
-            patience=config["train"]["early_stopping_patience"],
-            restore_best_weights=True,
-            verbose=1,
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_auc",
-            mode="max",
-            factor=0.2,
-            patience=2,
-            min_lr=1e-6,
-            verbose=1,
-        ),
-        tf.keras.callbacks.CSVLogger(str(logs_dir / "metrics.csv")),
-    ]
+    model: tf.keras.Model | None = None
+    previous_weights: list[np.ndarray] | None = None
 
-    if config["dashboard"]["enabled"]:
-        callbacks.append(
-            LiveDashboardCallback(
-                log_dir=tensorboard_run_dir,
-                validation_ds=test_ds,
-                prediction_threshold=config["dashboard"]["prediction_threshold"],
-                val_monitor_batches=config["dashboard"]["val_monitor_batches"],
-            )
-        )
-
-    logging.info("Starting training")
-    logging.info("TensorBoard run directory: %s", tensorboard_run_dir)
+    logging.info("Starting staged training")
+    logging.info("TensorBoard root directory: %s", tensorboard_run_dir)
     logging.info(
         "Open live dashboard with: tensorboard --logdir %s --port %d",
         logs_dir / "tensorboard",
         config["dashboard"]["port"],
     )
-    history = model.fit(
-        train_ds,
-        validation_data=test_ds,
-        epochs=config["train"]["epochs"],
-        callbacks=callbacks,
-        verbose=1,
-    )
-    logging.info("Training finished after %d epochs", len(history.history["loss"]))
 
-    test_results = model.evaluate(test_ds, verbose=0, return_dict=True)
-    logging.info("Test results: %s", test_results)
+    for stage in config["stages"]:
+        stage_dataset = datasets[stage["dataset"]]
+        stage_train_ds, stage_val_ds = stage_dataset
+        model = build_mobilenetv3_small(
+            input_shape=(
+                config["data"]["image_size"][0],
+                config["data"]["image_size"][1],
+                3,
+            ),
+            dropout_rate=config["model"]["dropout_rate"],
+            train_backbone=stage["train_backbone"],
+        )
+        model = compile_binary_model(model, learning_rate=stage["learning_rate"])
+        if previous_weights is not None:
+            model.set_weights(previous_weights)
+
+        stage_log_dir = tensorboard_run_dir / stage["name"]
+        stage_log_dir.mkdir(parents=True, exist_ok=True)
+
+        model = run_training_stage(
+            stage=stage,
+            model=model,
+            train_ds=stage_train_ds,
+            val_ds=stage_val_ds,
+            models_dir=models_dir,
+            stage_log_dir=stage_log_dir,
+            logs_dir=logs_dir,
+        )
+        previous_weights = model.get_weights()
+
+    if model is None:
+        raise RuntimeError("No training stages were executed.")
+
+    nih_results = model.evaluate(datasets["nih"][1], verbose=0, return_dict=True)
+    synthetic_results = model.evaluate(datasets["synthetic"][1], verbose=0, return_dict=True)
+    logging.info("NIH holdout results: %s", nih_results)
+    logging.info("Synthetic holdout results: %s", synthetic_results)
+
+    calibrate_decision_threshold(
+        model=model,
+        validation_ds=datasets["synthetic"][1],
+        output_path=models_dir / "decision_threshold.json",
+    )
 
     model.save(last_model_path)
     logging.info("Saved final checkpoint to %s", last_model_path)
@@ -276,7 +463,7 @@ def main() -> None:
     if config["export"]["enabled"]:
         export_int8_tflite(
             model=model,
-            train_ds=train_ds,
+            train_ds=datasets["synthetic"][0],
             output_path=models_dir / config["paths"]["tflite_name"],
             representative_batches=config["export"]["representative_batches"],
         )

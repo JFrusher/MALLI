@@ -41,11 +41,15 @@ class F1Score(tf.keras.metrics.Metric):
         recall = self.tp / (self.tp + self.fn + tf.keras.backend.epsilon())
         return 2.0 * ((precision * recall) / (precision + recall + tf.keras.backend.epsilon()))
 
-    def reset_states(self) -> None:
+    def reset_state(self) -> None:
         """Reset metric state at the start of each epoch."""
         self.tp.assign(0.0)
         self.fp.assign(0.0)
         self.fn.assign(0.0)
+
+    def reset_states(self) -> None:
+        """Backward-compatible alias for older Keras call sites."""
+        self.reset_state()
 
 
 def build_mobilenetv3_small(
