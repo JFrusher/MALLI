@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
-import json
 import logging
 import os
 from pathlib import Path
@@ -25,7 +24,11 @@ from utils.dashboard import LiveDashboardCallback, launch_tensorboard
 DEFAULT_CONFIG: Dict[str, Any] = {
     "data": {
         "dataset_root": "nih_data",
-        "zip_path": "archive.zip",
+        "zip_path": "dataverse_files.zip",
+        "cache_dir": "datasets/blood_smear/processed/tfrecord",
+        "use_tfrecord_cache": True,
+        "tfrecord_shards": 16,
+        "rebuild_cache": False,
         "image_size": [224, 224],
         "test_split": 0.2,
         "batch_size": 64,
@@ -100,7 +103,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "launch_tensorboard": False,
         "port": 6006,
         "update_freq": "batch",
-        "histogram_freq": 1,
+        "histogram_freq": 0,
         "prediction_threshold": 0.5,
         "val_monitor_batches": 20,
     },
@@ -190,6 +193,10 @@ def build_dataset_registry(config: Dict[str, Any]) -> Dict[str, tuple[tf.data.Da
         test_split=config["data"]["test_split"],
         seed=config["data"]["seed"],
         zip_path=config["data"]["zip_path"],
+        cache_dir=config["data"]["cache_dir"],
+        use_tfrecord_cache=config["data"].get("use_tfrecord_cache", True),
+        tfrecord_shards=config["data"].get("tfrecord_shards", 16),
+        rebuild_cache=config["data"].get("rebuild_cache", False),
         extract_zip=False,
     )
     nih_train_ds, nih_val_ds = nih_dataset.create_datasets()
@@ -219,6 +226,7 @@ def run_training_stage(
     models_dir: Path,
     stage_log_dir: Path,
     logs_dir: Path,
+    dashboard_config: Dict[str, Any],
     export_monitor: str = "val_auc",
 ) -> tf.keras.Model:
     """Train one stage and return the best-restored model."""
@@ -229,10 +237,10 @@ def run_training_stage(
     callbacks = [
         tf.keras.callbacks.TensorBoard(
             log_dir=str(stage_log_dir),
-            histogram_freq=1,
-            write_graph=True,
+            histogram_freq=dashboard_config.get("histogram_freq", 0),
+            write_graph=False,
             write_images=False,
-            update_freq=1,
+            update_freq=dashboard_config.get("update_freq", "epoch"),
         ),
         tf.keras.callbacks.ModelCheckpoint(
             filepath=str(stage_checkpoint_path),
@@ -265,8 +273,8 @@ def run_training_stage(
             LiveDashboardCallback(
                 log_dir=stage_log_dir,
                 validation_ds=val_ds,
-                prediction_threshold=0.5,
-                val_monitor_batches=20,
+                prediction_threshold=dashboard_config.get("prediction_threshold", 0.5),
+                val_monitor_batches=dashboard_config.get("val_monitor_batches", 20),
             )
         )
 
@@ -441,6 +449,7 @@ def main() -> None:
             models_dir=models_dir,
             stage_log_dir=stage_log_dir,
             logs_dir=logs_dir,
+            dashboard_config=config["dashboard"],
         )
         previous_weights = model.get_weights()
 

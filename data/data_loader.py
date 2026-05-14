@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import zipfile
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import tensorflow as tf
 
@@ -33,6 +34,18 @@ if not hasattr(tf, "data"):
 AUTOTUNE = tf.data.AUTOTUNE
 
 
+def _int64_feature(value: int) -> tf.train.Feature:
+    return tf.train.Feature(int64_list=tf.train.Int64List(value=[int(value)]))
+
+
+def _float_feature(value: float) -> tf.train.Feature:
+    return tf.train.Feature(float_list=tf.train.FloatList(value=[float(value)]))
+
+
+def _bytes_feature(value: bytes) -> tf.train.Feature:
+    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+
 class MalariaDataset:
     """Create train/validation datasets for binary malaria cell classification.
 
@@ -50,6 +63,10 @@ class MalariaDataset:
         seed: int = 42,
         zip_path: Optional[str | Path] = None,
         extract_zip: bool = False,
+        cache_dir: Optional[str | Path] = None,
+        use_tfrecord_cache: bool = True,
+        tfrecord_shards: int = 16,
+        rebuild_cache: bool = False,
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.image_size = image_size
@@ -58,11 +75,21 @@ class MalariaDataset:
         self.seed = seed
         self.zip_path = Path(zip_path) if zip_path else None
         self.extract_zip = extract_zip
+        self.cache_dir = Path(cache_dir) if cache_dir else self.dataset_root / ".cache" / "tfrecord"
+        self.use_tfrecord_cache = use_tfrecord_cache
+        self.tfrecord_shards = max(1, int(tfrecord_shards))
+        self.rebuild_cache = rebuild_cache
 
-        self._class_dirs = self._prepare_dataset_layout()
+        self._class_dirs = self._resolve_class_dirs(self.dataset_root)
 
     def create_datasets(self) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
         """Build train and test `tf.data.Dataset` pipelines."""
+        if self.use_tfrecord_cache:
+            return self._create_tfrecord_datasets()
+
+        if self._class_dirs is None:
+            self._class_dirs = self._prepare_dataset_layout()
+
         samples = self._collect_labeled_files()
         train_samples, test_samples = self._stratified_split(samples)
 
@@ -80,6 +107,236 @@ class MalariaDataset:
                 "`nih_data/cell_images/Uninfected` are complete."
             )
         return train_ds, test_ds
+
+    def _create_tfrecord_datasets(self) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
+        """Create or reuse cached TFRecord shards for streaming training."""
+
+        cache_ready = self._cache_is_ready()
+        if not cache_ready or self.rebuild_cache:
+            self._build_tfrecord_cache()
+
+        train_records = sorted((self.cache_dir / "train").glob("*.tfrecord.gz"))
+        validation_records = sorted((self.cache_dir / "validation").glob("*.tfrecord.gz"))
+        if not train_records or not validation_records:
+            raise FileNotFoundError(
+                f"TFRecord cache is incomplete under {self.cache_dir}. "
+                "Rebuild the cache or disable `use_tfrecord_cache`."
+            )
+
+        train_ds = self._build_tfrecord_dataset(train_records, training=True)
+        validation_ds = self._build_tfrecord_dataset(validation_records, training=False)
+        return train_ds, validation_ds
+
+    def _cache_metadata_path(self) -> Path:
+        return self.cache_dir / "cache_manifest.json"
+
+    def _cache_is_ready(self) -> bool:
+        metadata_path = self._cache_metadata_path()
+        if not metadata_path.exists():
+            return False
+
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return False
+
+        train_dir = self.cache_dir / "train"
+        validation_dir = self.cache_dir / "validation"
+        train_files = list(train_dir.glob("*.tfrecord.gz"))
+        validation_files = list(validation_dir.glob("*.tfrecord.gz"))
+        return bool(metadata) and bool(train_files) and bool(validation_files)
+
+    def _build_tfrecord_cache(self) -> None:
+        """Materialize a compressed TFRecord cache from folders or a ZIP."""
+
+        samples = self._collect_source_samples()
+        train_samples, validation_samples = self._stratified_split(samples)
+        train_weights = self._class_weights(train_samples)
+        validation_weights = self._class_weights(validation_samples)
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "train").mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "validation").mkdir(parents=True, exist_ok=True)
+
+        self._write_tfrecord_shards(
+            split_name="train",
+            samples=train_samples,
+            weights=train_weights,
+        )
+        self._write_tfrecord_shards(
+            split_name="validation",
+            samples=validation_samples,
+            weights=validation_weights,
+        )
+
+        metadata = {
+            "source": str(self.zip_path) if self.zip_path else str(self.dataset_root),
+            "source_type": "zip" if self.zip_path and self.zip_path.exists() else "folders",
+            "image_size": list(self.image_size),
+            "test_split": self.test_split,
+            "tfrecord_shards": self.tfrecord_shards,
+            "train_count": len(train_samples),
+            "validation_count": len(validation_samples),
+        }
+        self._cache_metadata_path().write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        logging.info("Built TFRecord cache at %s", self.cache_dir)
+
+    def _class_weights(self, samples: Sequence[Tuple[str, int]]) -> dict[int, float]:
+        counts = {0: 0, 1: 0}
+        for _, label in samples:
+            counts[int(label)] += 1
+
+        total = max(1, len(samples))
+        counts = {label: max(1, count) for label, count in counts.items()}
+        return {label: float(total) / (2.0 * count) for label, count in counts.items()}
+
+    def _write_tfrecord_shards(
+        self,
+        split_name: str,
+        samples: Sequence[Tuple[str, int]],
+        weights: dict[int, float],
+    ) -> None:
+        output_dir = self.cache_dir / split_name
+        shard_count = min(self.tfrecord_shards, max(1, len(samples)))
+        shard_size = max(1, (len(samples) + shard_count - 1) // shard_count)
+        options = tf.io.TFRecordOptions(compression_type="GZIP")
+
+        for shard_index in range(shard_count):
+            start = shard_index * shard_size
+            end = min(len(samples), start + shard_size)
+            if start >= end:
+                break
+
+            shard_path = output_dir / f"part-{shard_index:05d}-of-{shard_count:05d}.tfrecord.gz"
+            with tf.io.TFRecordWriter(str(shard_path), options=options) as writer:
+                for source_path, label in samples[start:end]:
+                    image_bytes, rel_path = self._read_source_bytes(source_path)
+                    example = tf.train.Example(
+                        features=tf.train.Features(
+                            feature={
+                                "image/encoded": _bytes_feature(image_bytes),
+                                "label": _int64_feature(label),
+                                "weight": _float_feature(weights[int(label)]),
+                                "source_path": _bytes_feature(rel_path.encode("utf-8")),
+                            }
+                        )
+                    )
+                    writer.write(example.SerializeToString())
+
+    def _read_source_bytes(self, source_path: str) -> Tuple[bytes, str]:
+        path = Path(source_path)
+        if path.exists():
+            try:
+                rel_path = str(path.relative_to(self.dataset_root))
+            except ValueError:
+                rel_path = str(path)
+            return path.read_bytes(), rel_path
+
+        if self.zip_path is None or not self.zip_path.exists():
+            raise FileNotFoundError(f"Could not read source image bytes for {source_path}")
+
+        with zipfile.ZipFile(self.zip_path, "r") as archive:
+            with archive.open(source_path, "r") as file_handle:
+                return file_handle.read(), source_path
+
+    def _collect_source_samples(self) -> List[Tuple[str, int]]:
+        if self._class_dirs is not None:
+            return self._collect_labeled_files()
+
+        if self.zip_path is not None and self.zip_path.exists():
+            return self._collect_labeled_zip_entries()
+
+        if self.extract_zip:
+            self._class_dirs = self._prepare_dataset_layout()
+            return self._collect_labeled_files()
+
+        raise FileNotFoundError(
+            f"Could not locate class folders under {self.dataset_root} and no valid ZIP was provided."
+        )
+
+    def _collect_labeled_zip_entries(self) -> List[Tuple[str, int]]:
+        if self.zip_path is None:
+            raise FileNotFoundError("ZIP path was not configured.")
+
+        exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+        samples: List[Tuple[str, int]] = []
+
+        with zipfile.ZipFile(self.zip_path, "r") as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                path = Path(info.filename)
+                if path.suffix.lower() not in exts:
+                    continue
+                label = self._infer_label_from_path(path)
+                if label is None:
+                    continue
+                samples.append((info.filename, label))
+
+        if not samples:
+            raise ValueError(f"No image files were found in ZIP archive {self.zip_path}")
+
+        logging.info("Collected %d image entries from ZIP archive %s", len(samples), self.zip_path)
+        return samples
+
+    @staticmethod
+    def _infer_label_from_path(path: Path) -> Optional[int]:
+        parts = [part.lower() for part in path.parts]
+        if "parasitized" in parts:
+            return 1
+        if "uninfected" in parts:
+            return 0
+        return None
+
+    def _build_tfrecord_dataset(self, record_files: Sequence[Path], training: bool) -> tf.data.Dataset:
+        filenames = [str(path) for path in record_files]
+        ds = tf.data.TFRecordDataset(
+            filenames,
+            compression_type="GZIP",
+            num_parallel_reads=AUTOTUNE,
+        )
+
+        if training:
+            buffer_size = max(1024, len(filenames) * 32)
+            ds = ds.shuffle(buffer_size=buffer_size, seed=None, reshuffle_each_iteration=True)
+            ds = ds.map(self._parse_training_tfrecord, num_parallel_calls=AUTOTUNE)
+        else:
+            ds = ds.map(self._parse_validation_tfrecord, num_parallel_calls=AUTOTUNE)
+
+        return ds.batch(self.batch_size).prefetch(AUTOTUNE)
+
+    def _parse_training_tfrecord(self, serialized_example: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        features = self._parse_tfrecord_features(serialized_example)
+        image = self._decode_and_preprocess(features["image/encoded"], training=True)
+        label = tf.cast(features["label"], tf.float32)
+        weight = tf.cast(features["weight"], tf.float32)
+        return image, label, weight
+
+    def _parse_validation_tfrecord(self, serialized_example: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        features = self._parse_tfrecord_features(serialized_example)
+        image = self._decode_and_preprocess(features["image/encoded"], training=False)
+        label = tf.cast(features["label"], tf.float32)
+        return image, label
+
+    @staticmethod
+    def _parse_tfrecord_features(serialized_example: tf.Tensor) -> dict[str, tf.Tensor]:
+        feature_description = {
+            "image/encoded": tf.io.FixedLenFeature([], tf.string),
+            "label": tf.io.FixedLenFeature([], tf.int64),
+            "weight": tf.io.FixedLenFeature([], tf.float32),
+            "source_path": tf.io.FixedLenFeature([], tf.string),
+        }
+        return tf.io.parse_single_example(serialized_example, feature_description)
+
+    def _decode_and_preprocess(self, image_bytes: tf.Tensor, training: bool) -> tf.Tensor:
+        image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
+        image = tf.image.convert_image_dtype(image, tf.float32)
+        image = tf.image.resize(image, self.image_size)
+
+        image = stain_normalization_placeholder(image)
+        if training:
+            image = medical_augmentation(image)
+        return image
 
     def _prepare_dataset_layout(self) -> Tuple[Path, Path]:
         """Ensure class directories exist. Optionally extract a provided ZIP.
@@ -147,6 +404,12 @@ class MalariaDataset:
 
     def _collect_labeled_files(self) -> List[Tuple[str, int]]:
         """Collect image file paths and integer labels for both classes."""
+        if self._class_dirs is None:
+            raise FileNotFoundError(
+                f"Dataset folders not found under {self.dataset_root}. "
+                "Enable TFRecord caching with a ZIP source or extract the dataset first."
+            )
+
         parasitized_dir, uninfected_dir = self._class_dirs
         exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
