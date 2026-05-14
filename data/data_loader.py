@@ -111,9 +111,10 @@ class MalariaDataset:
     def _create_tfrecord_datasets(self) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
         """Create or reuse cached TFRecord shards for streaming training."""
 
-        cache_ready = self._cache_is_ready()
+        cache_ready, metadata = self._cache_is_ready()
         if not cache_ready or self.rebuild_cache:
             self._build_tfrecord_cache()
+            _, metadata = self._cache_is_ready()
 
         train_records = sorted((self.cache_dir / "train").glob("*.tfrecord.gz"))
         validation_records = sorted((self.cache_dir / "validation").glob("*.tfrecord.gz"))
@@ -123,28 +124,36 @@ class MalariaDataset:
                 "Rebuild the cache or disable `use_tfrecord_cache`."
             )
 
-        train_ds = self._build_tfrecord_dataset(train_records, training=True)
-        validation_ds = self._build_tfrecord_dataset(validation_records, training=False)
+        train_ds = self._build_tfrecord_dataset(
+            train_records,
+            training=True,
+            expected_samples=int(metadata.get("train_count", 0)),
+        )
+        validation_ds = self._build_tfrecord_dataset(
+            validation_records,
+            training=False,
+            expected_samples=int(metadata.get("validation_count", 0)),
+        )
         return train_ds, validation_ds
 
     def _cache_metadata_path(self) -> Path:
         return self.cache_dir / "cache_manifest.json"
 
-    def _cache_is_ready(self) -> bool:
+    def _cache_is_ready(self) -> Tuple[bool, dict]:
         metadata_path = self._cache_metadata_path()
         if not metadata_path.exists():
-            return False
+            return False, {}
 
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return False
+            return False, {}
 
         train_dir = self.cache_dir / "train"
         validation_dir = self.cache_dir / "validation"
         train_files = list(train_dir.glob("*.tfrecord.gz"))
         validation_files = list(validation_dir.glob("*.tfrecord.gz"))
-        return bool(metadata) and bool(train_files) and bool(validation_files)
+        return bool(metadata) and bool(train_files) and bool(validation_files), metadata
 
     def _build_tfrecord_cache(self) -> None:
         """Materialize a compressed TFRecord cache from folders or a ZIP."""
@@ -288,7 +297,12 @@ class MalariaDataset:
             return 0
         return None
 
-    def _build_tfrecord_dataset(self, record_files: Sequence[Path], training: bool) -> tf.data.Dataset:
+    def _build_tfrecord_dataset(
+        self,
+        record_files: Sequence[Path],
+        training: bool,
+        expected_samples: int,
+    ) -> tf.data.Dataset:
         filenames = [str(path) for path in record_files]
         ds = tf.data.TFRecordDataset(
             filenames,
@@ -303,7 +317,13 @@ class MalariaDataset:
         else:
             ds = ds.map(self._parse_validation_tfrecord, num_parallel_calls=AUTOTUNE)
 
-        return ds.batch(self.batch_size).prefetch(AUTOTUNE)
+        ds = ds.batch(self.batch_size)
+
+        if expected_samples > 0:
+            expected_batches = (expected_samples + self.batch_size - 1) // self.batch_size
+            ds = ds.apply(tf.data.experimental.assert_cardinality(expected_batches))
+
+        return ds.prefetch(AUTOTUNE)
 
     def _parse_training_tfrecord(self, serialized_example: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         features = self._parse_tfrecord_features(serialized_example)

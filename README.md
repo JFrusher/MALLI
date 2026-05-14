@@ -102,10 +102,3 @@ tensorboard --logdir logs/tensorboard --port 6006
 - When exporting for mobile, validate INT8 models on a representative calibration set (see `train.py` export settings).
 - Keep training logs under `logs/` and models under `models/` (both are already gitignored).
 
-## License
-
-See the repository `LICENSE` file for license terms.
-
----
-
-If you'd like, I can: (a) add a minimal `docs/CONTRIBUTING.md`, (b) insert example `config.json` templates, or (c) add CI badges and a changelog entry. Which would you prefer next?

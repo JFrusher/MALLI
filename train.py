@@ -31,7 +31,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "rebuild_cache": False,
         "image_size": [224, 224],
         "test_split": 0.2,
-        "batch_size": 64,
+        "batch_size": 16,
         "seed": 42,
         "synthetic_dataset_root": "synthetic_field_ready",
         "synthetic_labels_csv": "labels.csv",
@@ -177,7 +177,8 @@ def representative_dataset_generator(
     batches: int,
 ) -> Iterator[list[tf.Tensor]]:
     """Yield samples for post-training integer quantization calibration."""
-    for images, _ in dataset.take(batches):
+    for batch in dataset.take(batches):
+        images = batch[0]
         for i in range(images.shape[0]):
             sample = tf.expand_dims(images[i], axis=0).numpy().astype(np.float32)
             yield [sample]
