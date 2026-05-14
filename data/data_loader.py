@@ -205,7 +205,19 @@ class MalariaDataset:
         file_paths = [sample[0] for sample in samples]
         labels = [sample[1] for sample in samples]
 
-        ds = tf.data.Dataset.from_tensor_slices((file_paths, labels))
+        # When training, provide per-sample weights to rebalance classes so
+        # the model sees a more even contribution from each class.
+        if training:
+            total = len(labels)
+            counts = {0: 0, 1: 0}
+            for l in labels:
+                counts[int(l)] += 1
+            # avoid div-by-zero
+            counts = {k: max(1, v) for k, v in counts.items()}
+            weights = [float(total) / (2.0 * counts[int(l)]) for l in labels]
+            ds = tf.data.Dataset.from_tensor_slices((file_paths, labels, weights))
+        else:
+            ds = tf.data.Dataset.from_tensor_slices((file_paths, labels))
         if training:
             # Use a large buffer and allow reshuffling each iteration so
             # the training order changes every epoch. Avoid a fixed seed
@@ -214,10 +226,17 @@ class MalariaDataset:
             buffer_size = max(1024, len(file_paths))
             ds = ds.shuffle(buffer_size=buffer_size, seed=None, reshuffle_each_iteration=True)
 
-        ds = ds.map(
-            lambda path, label: self._load_and_preprocess(path, label, training),
-            num_parallel_calls=AUTOTUNE,
-        )
+        if training:
+            def _map_with_weight(path, label, weight):
+                image, lbl = self._load_and_preprocess(path, label, training)
+                return image, lbl, weight
+
+            ds = ds.map(_map_with_weight, num_parallel_calls=AUTOTUNE)
+        else:
+            ds = ds.map(
+                lambda path, label: self._load_and_preprocess(path, label, training),
+                num_parallel_calls=AUTOTUNE,
+            )
         ds = ds.batch(self.batch_size).prefetch(AUTOTUNE)
         return ds
 

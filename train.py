@@ -201,6 +201,7 @@ def build_dataset_registry(config: Dict[str, Any]) -> Dict[str, tuple[tf.data.Da
         batch_size=config["data"]["batch_size"],
         test_split=config["data"]["test_split"],
         seed=config["data"]["seed"],
+        augment_training=True,
     )
     synthetic_train_ds, synthetic_val_ds = synthetic_dataset.create_datasets()
 

@@ -70,7 +70,10 @@ def build_mobilenetv3_small(
     base_model.trainable = train_backbone
 
     inputs = tf.keras.Input(shape=input_shape, name="image")
-    x = tf.keras.applications.mobilenet_v3.preprocess_input(inputs)
+    # MobileNetV3 preprocess expects inputs in [0, 255]. our pipelines produce
+    # float images in [0, 1], so scale before calling the built-in preprocessor.
+    x = tf.keras.layers.Lambda(lambda t: t * 255.0, name="scale_0_255")(inputs)
+    x = tf.keras.applications.mobilenet_v3.preprocess_input(x)
     x = base_model(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D(name="global_avg_pool")(x)
     x = tf.keras.layers.Dropout(dropout_rate, name="dropout")(x)
