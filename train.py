@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
+import numpy as np
 import tensorflow as tf
 
 from data.data_loader import MalariaDataset
@@ -41,7 +42,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "models_dir": "models",
         "logs_dir": "logs",
         "best_model_name": "best_mobilenetv3_small.weights.h5",
-        "last_model_name": "last_mobilenetv3_small.h5",
+        "last_model_name": "last_mobilenetv3_small.keras",
         "tflite_name": "mobilenetv3_small_int8.tflite",
     },
     "export": {
@@ -129,7 +130,7 @@ def representative_dataset_generator(
     """Yield samples for post-training integer quantization calibration."""
     for images, _ in dataset.take(batches):
         for i in range(images.shape[0]):
-            sample = tf.expand_dims(images[i], axis=0)
+            sample = tf.expand_dims(images[i], axis=0).numpy().astype(np.float32)
             yield [sample]
 
 
@@ -216,21 +217,21 @@ def main() -> None:
         ),
         tf.keras.callbacks.ModelCheckpoint(
             filepath=str(best_model_path),
-            monitor="val_f1_score",
+            monitor="val_auc",
             mode="max",
             save_best_only=True,
             save_weights_only=True,
             verbose=1,
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_recall",
+            monitor="val_auc",
             mode="max",
             patience=config["train"]["early_stopping_patience"],
             restore_best_weights=True,
             verbose=1,
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_recall",
+            monitor="val_auc",
             mode="max",
             factor=0.2,
             patience=2,

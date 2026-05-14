@@ -207,7 +207,12 @@ class MalariaDataset:
 
         ds = tf.data.Dataset.from_tensor_slices((file_paths, labels))
         if training:
-            ds = ds.shuffle(buffer_size=len(file_paths), seed=self.seed)
+            # Use a large buffer and allow reshuffling each iteration so
+            # the training order changes every epoch. Avoid a fixed seed
+            # here because a constant seed produces the same shuffled
+            # order on each epoch which can cause class-ordering issues.
+            buffer_size = max(1024, len(file_paths))
+            ds = ds.shuffle(buffer_size=buffer_size, seed=None, reshuffle_each_iteration=True)
 
         ds = ds.map(
             lambda path, label: self._load_and_preprocess(path, label, training),
