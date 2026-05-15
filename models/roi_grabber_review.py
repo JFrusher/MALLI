@@ -15,11 +15,15 @@ import logging
 import random
 import zipfile
 import io
+import tempfile
+import shutil
+import os
 
 import cv2
 import numpy as np
 import tensorflow as tf
 
+from .inference import load_model_with_weights
 from .roi_grabber import (
     SUPPORTED_EXTENSIONS,
     batch_predict_rois,
@@ -40,6 +44,7 @@ class ReviewSample:
     source_type: str
     source_id: str
     group_key: str
+    coverage_key: str
     label_name: str
     smear_type: str
 
@@ -61,6 +66,16 @@ class SensingVariant:
 class VariantProposal:
     variant: SensingVariant
     proposal: RoiProposal
+
+
+@dataclass(frozen=True)
+class RoiAnalysisLine:
+    rank: int
+    variant_name: str
+    proposal_score: float | None
+    classifier_score: float | None
+    decision: str
+    box: tuple[int, int, int, int]
 
 
 SENSING_VARIANT_COLORS: tuple[tuple[int, int, int], ...] = (
@@ -115,6 +130,10 @@ def infer_group_key(parts_lower: Sequence[str], fallback_name: str) -> str:
     return fallback_name.lower().replace(" ", "_")
 
 
+def make_coverage_key(label_name: str, smear_type: str) -> str:
+    return f"{smear_type}_{label_name.lower()}"
+
+
 def crawl_folder_samples(dataset_root: Path, thick_min_dim: int) -> list[ReviewSample]:
     samples: list[ReviewSample] = []
     for path in dataset_root.rglob("*"):
@@ -140,6 +159,7 @@ def crawl_folder_samples(dataset_root: Path, thick_min_dim: int) -> list[ReviewS
                 source_type="folder",
                 source_id=str(path),
                 group_key=group,
+                coverage_key=make_coverage_key(label, smear),
                 label_name=label,
                 smear_type=smear,
             )
@@ -176,6 +196,7 @@ def crawl_zip_samples(zip_path: Path, thick_min_dim: int) -> list[ReviewSample]:
                         source_type="zip",
                         source_id=info.filename,
                         group_key=group,
+                        coverage_key=make_coverage_key(label, smear),
                         label_name=label,
                         smear_type=smear,
                     )
@@ -185,40 +206,51 @@ def crawl_zip_samples(zip_path: Path, thick_min_dim: int) -> list[ReviewSample]:
             if ext != ".zip":
                 continue
 
-            nested_bytes = archive.read(info.filename)
-            with zipfile.ZipFile(io.BytesIO(nested_bytes), "r") as nested:
-                for nested_info in nested.infolist():
-                    if nested_info.is_dir():
-                        continue
-                    nested_entry = Path(nested_info.filename)
-                    if nested_entry.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                        continue
+            # Stream nested zip entry to disk to avoid memory blowup.
+            with archive.open(info.filename) as nested_fp:
+                tmpf = tempfile.NamedTemporaryFile(delete=False)
+                try:
+                    shutil.copyfileobj(nested_fp, tmpf)
+                    tmpf.close()
+                    with zipfile.ZipFile(tmpf.name, "r") as nested:
+                        for nested_info in nested.infolist():
+                            if nested_info.is_dir():
+                                continue
+                            nested_entry = Path(nested_info.filename)
+                            if nested_entry.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                                continue
 
-                    combined_parts = [part.lower() for part in entry.parts] + [
-                        part.lower() for part in nested_entry.parts
-                    ]
-                    label = infer_label_from_parts(combined_parts)
-                    if label is None:
-                        continue
+                            combined_parts = [part.lower() for part in entry.parts] + [
+                                part.lower() for part in nested_entry.parts
+                            ]
+                            label = infer_label_from_parts(combined_parts)
+                            if label is None:
+                                continue
 
-                    smear = infer_smear_type_from_parts(combined_parts)
-                    if smear is None:
-                        image = read_image_from_zip(nested, nested_info.filename)
-                        if image is None:
-                            continue
-                        h, w = image.shape[:2]
-                        smear = infer_smear_type_by_dimensions(h, w, thick_min_dim=thick_min_dim)
+                            smear = infer_smear_type_from_parts(combined_parts)
+                            if smear is None:
+                                image = read_image_from_zip(nested, nested_info.filename)
+                                if image is None:
+                                    continue
+                                h, w = image.shape[:2]
+                                smear = infer_smear_type_by_dimensions(h, w, thick_min_dim=thick_min_dim)
 
-                    group = infer_group_key(combined_parts, fallback_name=entry.stem)
-                    samples.append(
-                        ReviewSample(
-                            source_type="nested_zip",
-                            source_id=make_nested_source_id(info.filename, nested_info.filename),
-                            group_key=group,
-                            label_name=label,
-                            smear_type=smear,
-                        )
-                    )
+                            group = infer_group_key(combined_parts, fallback_name=entry.stem)
+                            samples.append(
+                                ReviewSample(
+                                    source_type="nested_zip",
+                                    source_id=make_nested_source_id(info.filename, nested_info.filename),
+                                    group_key=group,
+                                    coverage_key=make_coverage_key(label, smear),
+                                    label_name=label,
+                                    smear_type=smear,
+                                )
+                            )
+                finally:
+                    try:
+                        os.remove(tmpf.name)
+                    except Exception:
+                        pass
     return samples
 
 
@@ -231,6 +263,24 @@ def stratified_sample_by_group(samples: Sequence[ReviewSample], per_group: int, 
     selected: list[ReviewSample] = []
     for key in sorted(groups.keys()):
         pool = groups[key]
+        if not pool:
+            continue
+        k = min(per_group, len(pool))
+        selected.extend(rng.sample(pool, k))
+
+    rng.shuffle(selected)
+    return selected
+
+
+def stratified_sample_by_coverage(samples: Sequence[ReviewSample], per_group: int, seed: int) -> list[ReviewSample]:
+    coverage_groups: dict[str, list[ReviewSample]] = {}
+    for sample in samples:
+        coverage_groups.setdefault(sample.coverage_key, []).append(sample)
+
+    rng = random.Random(seed)
+    selected: list[ReviewSample] = []
+    for key in sorted(coverage_groups.keys()):
+        pool = coverage_groups[key]
         if not pool:
             continue
         k = min(per_group, len(pool))
@@ -324,9 +374,9 @@ def segment_thick_smear_variant(image_bgr: np.ndarray, variant: SensingVariant) 
     distance_ratio = float(np.clip(variant.distance_ratio, 0.1, 0.7))
     _, sure_fg = cv2.threshold(distance, distance_ratio * max_distance, 255, 0)
     sure_fg_u8 = np.uint8(sure_fg)
-    unknown = cv2.subtract(sure_bg, sure_fg_u8)
+    unknown = cv2.subtract(sure_bg, sure_fg_u8.astype(np.uint8))  # type: ignore[arg-type]
 
-    _, markers = cv2.connectedComponents(sure_fg_u8)
+    _, markers = cv2.connectedComponents(sure_fg_u8.astype(np.uint8))  # type: ignore[arg-type]
     markers = markers + 1
     markers[unknown == 255] = 0
 
@@ -355,7 +405,7 @@ def extract_variant_proposals(
 
     proposals = extract_roi_proposals(
         mask,
-        image_shape=image.shape,
+            image_shape=(int(image.shape[0]), int(image.shape[1]), int(image.shape[2])),
         roi_size=roi_size,
         min_blob_area=min_blob_area,
         max_blob_area=max_blob_area,
@@ -366,28 +416,51 @@ def extract_variant_proposals(
 def draw_variant_overlay(
     image_bgr: np.ndarray,
     proposals: Sequence[VariantProposal],
-    probabilities: np.ndarray | None,
+    classifier_scores: np.ndarray | None,
+    proposal_scores: np.ndarray | None,
     kept_indices: set[int],
     positive_indices: set[int],
+    display_threshold: float | None = None,
 ) -> np.ndarray:
     overlay = image_bgr.copy()
 
     for idx, variant_proposal in enumerate(proposals):
         x1, y1, x2, y2 = variant_proposal.proposal.box
-        score_text = ""
-        if probabilities is not None and probabilities.size > idx:
-            score_text = f" {probabilities[idx]:.2f}"
+        proposal_score = None
+        if proposal_scores is not None and proposal_scores.size > idx:
+            proposal_score = float(proposal_scores[idx])
 
-        label = f"{variant_proposal.variant.name}{score_text}"
+        classifier_score = None
+        if classifier_scores is not None and classifier_scores.size > idx:
+            classifier_score = float(classifier_scores[idx])
+
+        label_parts = [variant_proposal.variant.name]
+        if proposal_score is not None:
+            label_parts.append(f"src={proposal_score:.2f}")
+        if classifier_score is not None:
+            label_parts.append(f"mnet={classifier_score:.2f}")
+            label_parts.append("INF" if classifier_score >= (display_threshold if display_threshold is not None else 0.3) else "HLT")
+
+        label = " | ".join(label_parts)
         thickness = 4 if idx in positive_indices else 2 if idx in kept_indices else 1
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), variant_proposal.variant.color, thickness)
+        color = variant_proposal.variant.color
+        if classifier_score is not None:
+            color = confidence_to_bgr(classifier_score, display_threshold if display_threshold is not None else 0.3)
+        elif proposal_score is not None:
+            color = confidence_to_bgr(proposal_score, 0.5)
+
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+        text_bg_x2 = min(overlay.shape[1] - 1, x1 + text_size[0] + 6)
+        text_bg_y1 = max(0, y1 - text_size[1] - 10)
+        cv2.rectangle(overlay, (x1, text_bg_y1), (text_bg_x2, max(0, y1 - 2)), color, -1)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(
             overlay,
             label,
-            (x1, max(18, y1 - 6)),
+            (x1 + 3, max(14, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
-            variant_proposal.variant.color,
+            (255, 255, 255),
             1,
             cv2.LINE_AA,
         )
@@ -414,6 +487,57 @@ def build_variant_legend(
     return legend_lines
 
 
+def build_roi_analysis_lines(
+    proposals: Sequence[VariantProposal],
+    proposal_scores: np.ndarray | None,
+    classifier_scores: np.ndarray | None,
+    kept_indices: Sequence[int],
+    threshold: float,
+    max_lines: int,
+) -> list[str]:
+    if not proposals:
+        return []
+
+    order = list(kept_indices)
+    if classifier_scores is not None:
+        order.sort(key=lambda idx: float(classifier_scores[idx]), reverse=True)
+    elif proposal_scores is not None:
+        order.sort(key=lambda idx: float(proposal_scores[idx]), reverse=True)
+
+    lines: list[str] = []
+    for rank, idx in enumerate(order[:max_lines], start=1):
+        proposal = proposals[idx]
+        proposal_score = float(proposal_scores[idx]) if proposal_scores is not None and proposal_scores.size > idx else None
+        classifier_score = float(classifier_scores[idx]) if classifier_scores is not None and classifier_scores.size > idx else None
+        decision = "N/A"
+        if classifier_score is not None:
+            decision = "INF" if classifier_score >= threshold else "HLT"
+        x1, y1, x2, y2 = proposal.proposal.box
+        score_bits: list[str] = []
+        if proposal_score is not None:
+            score_bits.append(f"src={proposal_score:.2f}")
+        if classifier_score is not None:
+            score_bits.append(f"mnet={classifier_score:.2f}")
+        score_text = " ".join(score_bits) if score_bits else "no-scores"
+        lines.append(
+            f"{rank:02d} {proposal.variant.name} {decision} {score_text} box=({x1},{y1},{x2},{y2})"
+        )
+    return lines
+
+
+def confidence_to_bgr(confidence: float, threshold: float) -> tuple[int, int, int]:
+    """Map confidence to a visible BGR color."""
+    conf = float(np.clip(confidence, 0.0, 1.0))
+    low = float(np.clip(threshold, 0.01, 0.99))
+    if conf <= low:
+        return (0, 165, 255)
+    ratio = (conf - low) / max(1e-6, 1.0 - low)
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    red = int(round(255 * (1.0 - ratio)))
+    green = int(round(255 * ratio))
+    return (0, green, red)
+
+
 def compute_overlay(
     sample: ReviewSample,
     image: np.ndarray,
@@ -429,17 +553,19 @@ def compute_overlay(
     yolo_weights: str | None = None,
     yolo_conf: float = 0.3,
     yolo_nms_iou: float = 0.5,
-) -> tuple[np.ndarray, int, int, float, list[str]]:
+    max_roi_analysis_lines: int = 10,
+) -> tuple[np.ndarray, int, int, float, list[str], list[str]]:
     variant_proposals: list[VariantProposal] = []
     raw_counts: Counter[str] = Counter()
+    proposal_scores: np.ndarray | None = None
 
     if use_yolo:
         try:
-            from .roi_grabber_yolo import yolov8_detect_proposals
+            from .roi_grabber_yolo import yolov8_detect_detections
         except Exception:
-            yolov8_detect_proposals = None
+            yolov8_detect_detections = None
 
-        if yolov8_detect_proposals is None or yolo_weights is None:
+        if yolov8_detect_detections is None or yolo_weights is None:
             # Fallback to original sensing variants
             variants = sensing_variants_for_smear(sample.smear_type)
             for variant in variants:
@@ -454,8 +580,8 @@ def compute_overlay(
                 raw_counts[variant.name] = len(proposals)
                 variant_proposals.extend(proposals)
         else:
-            # Use YOLO proposals and represent them as a single "yolo" variant
-            boxes = yolov8_detect_proposals(
+            # Use YOLO detections and represent them as a single "yolo" variant.
+            yolo_detections = yolov8_detect_detections(
                 image_bgr=image,
                 yolo_weights=yolo_weights,
                 conf_thresh=yolo_conf,
@@ -463,8 +589,15 @@ def compute_overlay(
                 roi_size=roi_size,
             )
             yolo_variant = SensingVariant("yolo", (0, 0, 255), 0, 0.0, 0.0, 0, 0, 0.0, 0)
-            raw_counts[yolo_variant.name] = len(boxes)
-            variant_proposals = [VariantProposal(variant=yolo_variant, proposal=prop) for prop in boxes]
+            raw_counts[yolo_variant.name] = len(yolo_detections)
+            variant_proposals = [
+                VariantProposal(
+                    variant=yolo_variant,
+                    proposal=RoiProposal(box=det.box, centroid=det.centroid, area=det.area),
+                )
+                for det in yolo_detections
+            ]
+            proposal_scores = np.array([det.confidence for det in yolo_detections], dtype=np.float32)
             variants = (yolo_variant,)
     else:
         variants = sensing_variants_for_smear(sample.smear_type)
@@ -481,7 +614,14 @@ def compute_overlay(
             variant_proposals.extend(proposals)
 
     if not variant_proposals:
-        return image.copy(), 0, 0, 0.0, build_variant_legend(variants, raw_counts, Counter(), Counter(), model is not None)
+        return (
+            image.copy(),
+            0,
+            0,
+            0.0,
+            build_variant_legend(variants, raw_counts, Counter(), Counter(), model is not None),
+            [],
+        )
 
     boxes = np.array([proposal.proposal.box for proposal in variant_proposals], dtype=np.float32)
     if model is None:
@@ -516,16 +656,26 @@ def compute_overlay(
     overlay = draw_variant_overlay(
         image_bgr=image,
         proposals=variant_proposals,
-        probabilities=probabilities,
+        classifier_scores=probabilities,
+        proposal_scores=proposal_scores,
         kept_indices=kept_indices,
         positive_indices=positive_indices,
+        display_threshold=yolo_conf if use_yolo else threshold,
     )
 
     total_cells = len(kept_indices_list)
     parasites = len(positive_indices)
     parasitemia = (100.0 * parasites / total_cells) if total_cells > 0 else 0.0
     legend_lines = build_variant_legend(variants, raw_counts, kept_counts, positive_counts, model is not None)
-    return overlay, total_cells, parasites, parasitemia, legend_lines
+    analysis_lines = build_roi_analysis_lines(
+        proposals=variant_proposals,
+        proposal_scores=proposal_scores,
+        classifier_scores=probabilities,
+        kept_indices=kept_indices_list,
+        threshold=threshold,
+        max_lines=max_roi_analysis_lines,
+    )
+    return overlay, total_cells, parasites, parasitemia, legend_lines, analysis_lines
 
 
 def annotate_hud(
@@ -539,6 +689,7 @@ def annotate_hud(
     threshold: float,
     active_group: str,
     variant_legend: Sequence[str],
+    roi_analysis_lines: Sequence[str],
 ) -> np.ndarray:
     canvas = overlay.copy()
     header_lines = [
@@ -547,6 +698,9 @@ def annotate_hud(
         f"threshold={threshold:.2f} | keys: n/p next-prev, g cycle group, +/- threshold, s save, q quit",
     ]
     header_lines.extend(variant_legend)
+    if roi_analysis_lines:
+        header_lines.append("ROI analysis (top MobileNetV3-positive ROIs):")
+        header_lines.extend(roi_analysis_lines)
 
     y = 20
     for line in header_lines:
@@ -563,7 +717,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-zip", action="store_true", help="Force reading from ZIP")
     parser.add_argument("--per-group", type=int, default=30, help="Number of sampled images per folder-group")
     parser.add_argument("--seed", type=int, default=42, help="Sampling seed")
-    parser.add_argument("--model-path", type=Path, default=Path("models/last_mobilenetv3_small.keras"), help="Keras model path")
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=Path("models/best_mobilenetv3_small.weights.h5"),
+        help="MobileNetV3 weights or saved model path",
+    )
     parser.add_argument("--disable-model", action="store_true", help="Show ROI boxes only, without classifier labels")
     parser.add_argument("--threshold", type=float, default=0.85, help="Infected threshold")
     parser.add_argument("--roi-size", type=int, default=128, help="Minimum ROI side length for extracted crops")
@@ -580,12 +739,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-weights", type=str, default="yolov8n.pt", help="YOLO weights path (default yolov8n.pt)")
     parser.add_argument("--yolo-conf", type=float, default=0.3, help="YOLO detection confidence threshold")
     parser.add_argument("--yolo-nms-iou", type=float, default=0.5, help="YOLO NMS IoU threshold for proposals")
+    parser.add_argument("--roboflow-api-key", type=str, default=None, help="Roboflow API key to download a trained model")
+    parser.add_argument("--roboflow-workspace", type=str, default=None, help="Roboflow workspace name")
+    parser.add_argument("--roboflow-project", type=str, default=None, help="Roboflow project name")
+    parser.add_argument("--roboflow-version", type=int, default=1, help="Roboflow project version to download")
+    parser.add_argument("--roboflow-download-dir", type=str, default=None, help="Local directory to download Roboflow export")
+    parser.add_argument("--max-roi-analysis-lines", type=int, default=10, help="Maximum ROI analysis lines shown in the HUD")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     setup_logging(verbose=args.verbose)
+
+    def load_review_model(model_path: Path, input_size: tuple[int, int]) -> tf.keras.Model:
+        if model_path.suffix.lower() == ".weights.h5" or model_path.name.endswith(".weights.h5"):
+            return load_model_with_weights(
+                model_path,
+                input_shape=(input_size[0], input_size[1], 3),
+                compile_model=False,
+            )
+
+        try:
+            return tf.keras.models.load_model(str(model_path), compile=False, safe_mode=False)
+        except TypeError:
+            return tf.keras.models.load_model(str(model_path), compile=False)
 
     source_samples: list[ReviewSample]
     use_zip = bool(args.use_zip)
@@ -602,19 +780,46 @@ def main() -> None:
     if not source_samples:
         raise RuntimeError("No review samples were discovered.")
 
-    sampled = stratified_sample_by_group(source_samples, per_group=args.per_group, seed=args.seed)
+    sampled = stratified_sample_by_coverage(source_samples, per_group=args.per_group, seed=args.seed)
     if not sampled:
         raise RuntimeError("No sampled items were selected. Increase --per-group.")
 
     model: tf.keras.Model | None = None
     if not args.disable_model:
         logging.info("Loading model: %s", args.model_path)
-        model = tf.keras.models.load_model(str(args.model_path), compile=False)
+        try:
+            model = load_review_model(args.model_path, (args.model_input_size, args.model_input_size))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load MobileNetV3 model from {args.model_path}: {exc}") from exc
 
+    # If Roboflow credentials provided and YOLO usage requested, download weights
+    if args.use_yolo and args.roboflow_api_key:
+        try:
+            from .roi_grabber_yolo import download_roboflow_weights
+            yolo_path = download_roboflow_weights(
+                api_key=args.roboflow_api_key,
+                workspace=args.roboflow_workspace,
+                project=args.roboflow_project,
+                version=args.roboflow_version,
+                target_dir=args.roboflow_download_dir,
+            )
+            logging.info("Downloaded Roboflow YOLO weights: %s", yolo_path)
+            args.yolo_weights = yolo_path
+        except Exception as exc:
+            logging.warning("Roboflow download failed: %s", exc)
+
+    if args.save_dir.exists():
+        shutil.rmtree(args.save_dir)
     args.save_dir.mkdir(parents=True, exist_ok=True)
     model_input_size = (args.model_input_size, args.model_input_size)
 
     groups = sorted({sample.group_key for sample in sampled})
+    
+    # Log group distribution for debugging
+    group_counts = {g: sum(1 for s in sampled if s.group_key == g) for g in groups}
+    logging.info(f"Groups found in sampled data: {groups}")
+    logging.info(f"Group sample counts: {group_counts}")
+    
     active_group_idx = 0
     active_group = groups[active_group_idx]
 
@@ -624,20 +829,52 @@ def main() -> None:
     visible = filtered_indices(active_group)
     if not visible:
         visible = list(range(len(sampled)))
+        logging.warning(f"No samples found for group '{active_group}', showing all samples")
         active_group = "all"
+    else:
+        logging.info(f"Starting with group '{active_group}': {len(visible)} samples visible")
 
     visible_pos = 0
     threshold = float(args.threshold)
+    
+    # Print startup info
+    print("\n" + "="*70)
+    print("REVIEWER STARTUP INFO")
+    print("="*70)
+    print(f"Total samples: {len(sampled)}")
+    print(f"Available groups ({len(groups)}): {', '.join(groups)}")
+    for g in groups:
+        count = sum(1 for s in sampled if s.group_key == g)
+        print(f"  - {g}: {count} samples")
+    print(f"\nStarting with group: {active_group} ({len(visible)} visible)")
+    print("\nKeyboard controls:")
+    print("  n/d/→: Next image")
+    print("  p/a/←: Previous image")
+    print("  g: Cycle to next group")
+    print("  +/-: Adjust MobileNetV3 threshold")
+    print("  s: Save current overlay")
+    print("  q/ESC: Quit")
+    print("="*70 + "\n")
 
     zip_cache: zipfile.ZipFile | None = None
     nested_zip_cache: dict[str, zipfile.ZipFile] = {}
+    nested_zip_temp_paths: list[str] = []
     if use_zip:
         zip_cache = zipfile.ZipFile(args.zip_path, "r")
         for info in zip_cache.infolist():
             if info.is_dir() or not info.filename.lower().endswith(".zip"):
                 continue
-            nested_bytes = zip_cache.read(info.filename)
-            nested_zip_cache[info.filename] = zipfile.ZipFile(io.BytesIO(nested_bytes), "r")
+            # Stream nested ZIPs to a temp file to avoid decompressing large members
+            # directly into memory.
+            with zip_cache.open(info.filename) as nested_fp:
+                tmpf = tempfile.NamedTemporaryFile(delete=False)
+                try:
+                    shutil.copyfileobj(nested_fp, tmpf)
+                    tmpf.close()
+                    nested_zip_cache[info.filename] = zipfile.ZipFile(tmpf.name, "r")
+                    nested_zip_temp_paths.append(tmpf.name)
+                finally:
+                    pass
 
     interactive_mode = True
     try:
@@ -672,7 +909,7 @@ def main() -> None:
                 visible_pos = (visible_pos + 1) % max(1, len(visible))
                 continue
 
-            overlay, total_cells, parasites, parasitemia, variant_legend = compute_overlay(
+            overlay, total_cells, parasites, parasitemia, variant_legend, roi_analysis_lines = compute_overlay(
                 sample=sample,
                 image=image,
                 model=model,
@@ -687,6 +924,7 @@ def main() -> None:
                 yolo_weights=args.yolo_weights,
                 yolo_conf=args.yolo_conf,
                 yolo_nms_iou=args.yolo_nms_iou,
+                max_roi_analysis_lines=args.max_roi_analysis_lines,
             )
 
             hud = annotate_hud(
@@ -700,6 +938,7 @@ def main() -> None:
                 threshold=threshold,
                 active_group=active_group,
                 variant_legend=variant_legend,
+                roi_analysis_lines=roi_analysis_lines[: max(0, args.max_roi_analysis_lines)],
             )
             if not interactive_mode:
                 out_name = f"review_{sample_idx:05d}_{Path(sample.source_id).stem}.png"
@@ -725,9 +964,15 @@ def main() -> None:
             if key == ord("g"):
                 if groups:
                     active_group_idx = (active_group_idx + 1) % len(groups)
-                    active_group = groups[active_group_idx]
-                    visible = filtered_indices(active_group)
-                    visible_pos = 0
+                    new_group = groups[active_group_idx]
+                    visible = filtered_indices(new_group)
+                    if visible:
+                        active_group = new_group
+                        visible_pos = 0
+                        logging.info(f"Cycled to group '{new_group}': {len(visible)} samples visible")
+                    else:
+                        logging.warning(f"Group '{new_group}' is empty, staying on current group")
+                        active_group_idx = (active_group_idx - 1) % len(groups)
                 continue
             if key in (ord("+"), ord("=")):
                 threshold = min(0.99, threshold + 0.01)
@@ -746,6 +991,11 @@ def main() -> None:
             nested_archive.close()
         if zip_cache is not None:
             zip_cache.close()
+        for temp_path in nested_zip_temp_paths:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
         if interactive_mode:
             try:
                 cv2.destroyAllWindows()

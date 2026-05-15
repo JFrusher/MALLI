@@ -22,6 +22,9 @@ import json
 import logging
 import re
 import zipfile
+import tempfile
+import shutil
+import os
 
 import cv2
 import numpy as np
@@ -197,38 +200,49 @@ def crawl_dataverse_zip(zip_path: Path, thick_min_dim: int = 512) -> list[ImageS
             if ext != ".zip":
                 continue
 
-            nested_bytes = archive.read(info.filename)
-            with zipfile.ZipFile(io.BytesIO(nested_bytes), "r") as nested:
-                for nested_info in nested.infolist():
-                    if nested_info.is_dir():
-                        continue
-                    nested_entry = Path(nested_info.filename)
-                    if nested_entry.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                        continue
+            # Stream the nested zip entry to a temporary file to avoid loading
+            # large nested archives fully into memory (prevents MemoryError).
+            with archive.open(info.filename) as nested_fp:
+                tmpf = tempfile.NamedTemporaryFile(delete=False)
+                try:
+                    shutil.copyfileobj(nested_fp, tmpf)
+                    tmpf.close()
+                    with zipfile.ZipFile(tmpf.name, "r") as nested:
+                        for nested_info in nested.infolist():
+                            if nested_info.is_dir():
+                                continue
+                            nested_entry = Path(nested_info.filename)
+                            if nested_entry.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                                continue
 
-                    combined_parts = [part.lower() for part in entry.parts] + [
-                        part.lower() for part in nested_entry.parts
-                    ]
-                    label = infer_label_from_parts(combined_parts)
-                    if label is None:
-                        continue
+                            combined_parts = [part.lower() for part in entry.parts] + [
+                                part.lower() for part in nested_entry.parts
+                            ]
+                            label = infer_label_from_parts(combined_parts)
+                            if label is None:
+                                continue
 
-                    smear_type = infer_smear_type_from_parts(combined_parts)
-                    if smear_type is None:
-                        image = read_image_from_zip(nested, nested_info.filename)
-                        if image is None:
-                            continue
-                        h, w = image.shape[:2]
-                        smear_type = infer_smear_type_by_dimensions(h, w, thick_min_dim=thick_min_dim)
+                            smear_type = infer_smear_type_from_parts(combined_parts)
+                            if smear_type is None:
+                                image = read_image_from_zip(nested, nested_info.filename)
+                                if image is None:
+                                    continue
+                                h, w = image.shape[:2]
+                                smear_type = infer_smear_type_by_dimensions(h, w, thick_min_dim=thick_min_dim)
 
-                    samples.append(
-                        ImageSample(
-                            source_type="nested_zip",
-                            source_id=make_nested_source_id(info.filename, nested_info.filename),
-                            label_name=label,
-                            smear_type=smear_type,
-                        )
-                    )
+                            samples.append(
+                                ImageSample(
+                                    source_type="nested_zip",
+                                    source_id=make_nested_source_id(info.filename, nested_info.filename),
+                                    label_name=label,
+                                    smear_type=smear_type,
+                                )
+                            )
+                finally:
+                    try:
+                        os.remove(tmpf.name)
+                    except Exception:
+                        pass
 
     if not samples:
         raise ValueError("No image samples were discovered in the ZIP archive.")
@@ -732,6 +746,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-weights", type=str, default="yolov8n.pt", help="YOLO weights path (default yolov8n.pt)")
     parser.add_argument("--yolo-conf", type=float, default=0.3, help="YOLO detection confidence threshold")
     parser.add_argument("--yolo-nms-iou", type=float, default=0.5, help="YOLO NMS IoU threshold for proposals")
+    parser.add_argument("--roboflow-api-key", type=str, default=None, help="Roboflow API key to download a trained model")
+    parser.add_argument("--roboflow-workspace", type=str, default=None, help="Roboflow workspace name")
+    parser.add_argument("--roboflow-project", type=str, default=None, help="Roboflow project name")
+    parser.add_argument("--roboflow-version", type=int, default=1, help="Roboflow project version to download")
+    parser.add_argument("--roboflow-download-dir", type=str, default=None, help="Local directory to download Roboflow export")
     return parser.parse_args()
 
 
@@ -755,7 +774,26 @@ def main() -> None:
         samples = samples[: args.limit]
 
     logging.info("Loading model: %s", args.model_path)
-    model = tf.keras.models.load_model(str(args.model_path), compile=False)
+    try:
+        model = tf.keras.models.load_model(str(args.model_path), compile=False, safe_mode=False)
+    except TypeError:
+        model = tf.keras.models.load_model(str(args.model_path), compile=False)
+
+    # If Roboflow credentials provided and YOLO usage requested, download weights
+    if args.use_yolo and args.roboflow_api_key:
+        try:
+            from .roi_grabber_yolo import download_roboflow_weights
+            yolo_path = download_roboflow_weights(
+                api_key=args.roboflow_api_key,
+                workspace=args.roboflow_workspace,
+                project=args.roboflow_project,
+                version=args.roboflow_version,
+                target_dir=args.roboflow_download_dir,
+            )
+            logging.info("Downloaded Roboflow YOLO weights: %s", yolo_path)
+            args.yolo_weights = yolo_path
+        except Exception as exc:
+            logging.warning("Roboflow download failed: %s", exc)
 
     model_input_size = (args.model_input_size, args.model_input_size)
     results: list[ImageResult] = []

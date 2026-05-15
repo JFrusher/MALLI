@@ -12,6 +12,7 @@ import tempfile
 import os
 import numpy as np
 import cv2
+from dataclasses import dataclass
 
 try:
     from ultralytics import YOLO
@@ -21,14 +22,22 @@ except Exception:  # pragma: no cover - optional dependency
 from .roi_grabber import RoiProposal, non_max_suppression
 
 
-def yolov8_detect_proposals(
+@dataclass(frozen=True)
+class YoloDetection:
+    box: tuple[int, int, int, int]
+    centroid: tuple[int, int]
+    area: float
+    confidence: float
+
+
+def yolov8_detect_detections(
     image_bgr: np.ndarray,
     yolo_weights: str = "yolov8n.pt",
     conf_thresh: float = 0.3,
     nms_iou: float = 0.5,
     roi_size: int = 128,
-) -> List[RoiProposal]:
-    """Run YOLOv8 on the provided BGR image and return ROI proposals.
+) -> List[YoloDetection]:
+    """Run YOLOv8 on the provided BGR image and return filtered detections.
 
     This helper writes a temp image file and calls Ultralytics' API to
     ensure compatibility with different ultralytics versions.
@@ -63,17 +72,83 @@ def yolov8_detect_proposals(
         scores_np = np.array(scores, dtype=np.float32)
         keep = non_max_suppression(boxes_np, scores_np, iou_threshold=nms_iou)
 
-        proposals: List[RoiProposal] = []
+        detections: List[YoloDetection] = []
         for idx in keep:
             x1, y1, x2, y2 = boxes[idx]
             cx = int((x1 + x2) / 2)
             cy = int((y1 + y2) / 2)
             area = float((x2 - x1) * (y2 - y1))
-            proposals.append(RoiProposal(box=(x1, y1, x2, y2), centroid=(cx, cy), area=area))
+            detections.append(
+                YoloDetection(
+                    box=(x1, y1, x2, y2),
+                    centroid=(cx, cy),
+                    area=area,
+                    confidence=float(scores[idx]),
+                )
+            )
 
-        return proposals
+        return detections
     finally:
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+
+
+def yolov8_detect_proposals(
+    image_bgr: np.ndarray,
+    yolo_weights: str = "yolov8n.pt",
+    conf_thresh: float = 0.3,
+    nms_iou: float = 0.5,
+    roi_size: int = 128,
+) -> List[RoiProposal]:
+    detections = yolov8_detect_detections(
+        image_bgr=image_bgr,
+        yolo_weights=yolo_weights,
+        conf_thresh=conf_thresh,
+        nms_iou=nms_iou,
+        roi_size=roi_size,
+    )
+    return [RoiProposal(box=d.box, centroid=d.centroid, area=d.area) for d in detections]
+
+
+def download_roboflow_weights(
+    api_key: str,
+    workspace: str,
+    project: str,
+    version: int | str = 1,
+    target_dir: str | None = None,
+) -> str:
+    """Download a Roboflow YOLOv8 export and return the path to a .pt weights file.
+
+    The function requires the `roboflow` package to be installed. It calls
+    `version.download("yolov8")` and searches the downloaded folder for a
+    *.pt file. Raises RuntimeError on failure.
+    """
+    try:
+        from roboflow import Roboflow
+    except Exception as exc:  # pragma: no cover - requires optional dependency
+        raise RuntimeError("roboflow package is required to download weights: " + str(exc))
+
+    rf = Roboflow(api_key=api_key)
+    ws = rf.workspace(workspace)
+    proj = ws.project(project)
+    ver = proj.version(int(version))
+
+    out_dir = target_dir or os.path.join(os.getcwd(), "roboflow_download")
+    os.makedirs(out_dir, exist_ok=True)
+    dl = ver.download("yolov8", location=out_dir)
+
+    # Search for .pt weights under the downloaded directory
+    for root, _, files in os.walk(dl):
+        for fn in files:
+            if fn.lower().endswith(".pt"):
+                return os.path.join(root, fn)
+
+    # Try searching the top-level target_dir too
+    for root, _, files in os.walk(out_dir):
+        for fn in files:
+            if fn.lower().endswith(".pt"):
+                return os.path.join(root, fn)
+
+    raise RuntimeError(f"No .pt weights found in Roboflow download at {dl} / {out_dir}")
