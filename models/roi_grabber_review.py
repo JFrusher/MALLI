@@ -660,7 +660,8 @@ def compute_overlay(
         proposal_scores=proposal_scores,
         kept_indices=kept_indices,
         positive_indices=positive_indices,
-        display_threshold=yolo_conf if use_yolo else threshold,
+        # Use the classifier threshold for visualizing INF/HLT and coloring
+        display_threshold=threshold,
     )
 
     total_cells = len(kept_indices_list)
@@ -886,6 +887,11 @@ def main() -> None:
             "OpenCV GUI support is unavailable; falling back to non-interactive export mode: %s",
             exc,
         )
+        # In non-interactive mode, export all sampled items rather than just the
+        # initially selected group so users get full coverage when GUI is missing.
+        visible = list(range(len(sampled)))
+        active_group = "all"
+        logging.info("Non-interactive export mode: exporting %d sampled overlays", len(visible))
 
     try:
         while True:
