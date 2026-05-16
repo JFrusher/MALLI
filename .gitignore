@@ -1,0 +1,450 @@
+# ============================================================================
+# M.A.L.L.I. Repository - Comprehensive .gitignore
+# Handles both ML/Python development and Mobile App development
+# ============================================================================
+
+# ============================================================================
+# PYTHON / ML / DATA SCIENCE
+# ============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+.env
+*.egg-info/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+*checkpoint.ipynb
+
+# ============================================================================
+# ML / DATA SCIENCE SPECIFIC
+# ============================================================================
+
+# Large model files
+*.h5
+*.keras
+*.weights
+*.weights.h5
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.pb
+*.model
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+!models/best_*.h5
+!models/inference_*.tflite
+
+# Datasets and data directories
+datasets/
+nih_data/
+synthetic_field_ready/
+data/
+data_cache/
+data_raw/
+data_processed/
+/cache/
+/tmp/
+*.zip
+*.tar.gz
+*.tar.bz2
+
+# Training artifacts and checkpoints
+experiments/logs/checkpoints/
+experiments/logs/exports/
+experiments/logs/tensorboard/
+experiments/logs/logs/training_*.log
+logs/
+models/checkpoints/
+models/weights/
+models/exports/
+outputs/
+diagnostics/
+results/
+test_results/
+roi_review/
+
+# TensorBoard / Training logs
+*.event
+tensorboard/
+training_logs/
+events.out.tfevents.*
+
+# ============================================================================
+# PYTHON IDEs / EDITORS
+# ============================================================================
+
+# VSCode
+.vscode/
+.vscode/settings.json
+.vscode/launch.json
+.vscode/extensions.json
+.vscode/tasks.json
+
+# PyCharm / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+*.iml
+*.xml
+.idea_modules/
+out/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+.vim/
+.viminfo
+*.swo
+*.swp
+*~
+
+# Emacs
+.#*
+\#*\#
+
+# Atom
+.atom/
+
+# Thonny
+.thonny_markers
+
+# ============================================================================
+# MOBILE APP / FLUTTER / DART / REACT-NATIVE
+# ============================================================================
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+coverage/
+GeneratedPluginRegistrant.dart
+GeneratedPluginRegistrant.java
+GeneratedPluginRegistrant.h
+GeneratedPluginRegistrant.cpp
+
+# iOS specific
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/.last_build_id
+**/ios/Pods/
+**/ios/Podfile.lock
+**/ios/.symlinks/
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Flutter/local.properties
+ios/Flutter/flutter_export_environment.sh
+
+# iOS build artifacts
+**/ios/**/*.mode1v3
+**/ios/**/*.mode2v3
+**/ios/**/*.perspectivev3
+**/ios/**/*.pbxuser
+**/ios/**/*.xcbkptlist
+**/ios/**/*.xcworkspace/xcuserdata/
+**/ios/**/*.xcworkspace/xcshareddata/xcschemes/
+**/ios/**/*.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+
+# Xcode
+build/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcworkspace
+xcuserdata/
+*.xccheckout
+*.moved-aside
+DerivedData/
+*.hmap
+*.ipa
+*.xcarchive
+*.xcworkspace
+.xcode.env
+.xcode.env.local
+playground.xcworkspace
+
+# Android / Gradle
+**/android/app/debug
+**/android/app/profile
+**/android/app/release
+**/android/local.properties
+**/android/.gradle
+**/android/**/*.gradle
+**/android/**/*.properties
+**/android/build/
+**/android/.gradle/
+**/android/*.gradle
+**/android/gradle.properties
+**/android/gradlew
+**/android/gradlew.bat
+.gradle
+gradle-wrapper.jar
+gradle-wrapper.properties
+
+# Android Studio
+.idea/
+.gradle
+.DS_Store
+build/
+local.properties
+
+# React Native (if applicable)
+node_modules/
+npm-debug.log
+yarn-error.log
+.npm
+.eslintcache
+.node_repl_history
+*.tgz
+.yarn-integrity
+.env
+.env.production
+
+# ============================================================================
+# SYSTEM & OS FILES
+# ============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*~
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+.TemporaryItems
+.VolumeIcon.icns
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msapp
+*.appx
+*.appxbundle
+*.exe
+*.dll
+*.manifest
+
+# Linux
+.directory
+.sync
+
+# ============================================================================
+# ENVIRONMENT & CONFIGURATION (NEVER COMMIT SECRETS)
+# ============================================================================
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.env.production.local
+.env.development.local
+.env.test.local
+.env.*.example
+python.env
+
+# Configuration with secrets
+config/local.json
+config/secrets.json
+.credentials
+.aws/
+.gcloud/
+credentials.json
+service-account-key.json
+firebase-key.json
+google-services.json
+GoogleService-Info.plist
+
+# Local development
+local.properties
+.user.properties
+local_settings.py
+development.ini
+
+# ============================================================================
+# TEMPORARY FILES & CACHES
+# ============================================================================
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.swp
+.~*
+~*
+
+# Cache directories
+.cache/
+*.cache
+__cache__/
+cache/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Coverage
+coverage.xml
+*.cover
+
+# ============================================================================
+# CI/CD & DEPLOYMENT
+# ============================================================================
+
+# GitHub Actions
+.github/workflows/secrets/
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# CI artifacts
+.travis/
+.gitlab-ci/
+.circleci/
+appveyor.yml
+
+# ============================================================================
+# LOGS (general, not documentation)
+# ============================================================================
+
+*.log
+*.log.*
+debug.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ============================================================================
+# INTERNAL REFERENCE DOCUMENTATION (Development Artifacts)
+# Hide internal design docs and work artifacts; public guides kept public
+# ============================================================================
+
+# Internal architecture & implementation notes
+ARCHITECTURE_MAPPING.md
+IMPLEMENTATION_COMPLETE.md
+IMPLEMENTATION_SUMMARY.md
+DETECTION_PIPELINE_IMPLEMENTATION.md
+reference.md
+PROFESSIONAL_TRAINING_IMPLEMENTATION.md
+START_HERE_TRAINING_PIPELINE.md
+
+# Internal design documentation (deep dives, reference materials)
+docs/deep_dive/
+docs/PIPELINE_STAGES_REFERENCE.md
+docs/synthetic_data_production.md
+docs/Roadmap.md
+docs/CELL_COUNTER_GUIDE.md
+
+# Internal service/module documentation
+ml/src/export/MODEL_EXPORT_GUIDE.md
+mobile/lib/services/DETECTION_PIPELINE_INTEGRATION.md
+
+# ============================================================================
+# EXCEPTIONS (Files that SHOULD be committed - Public Documentation)
+# ============================================================================
+
+!.github/
+!.gitignore
+!.gitattributes
+!.editorconfig
+!.env.example
+!.env.sample
+!ml/requirements.txt
+!ml/src/
+!ml/TRAINING_GUIDE.md
+!ml/CLI_REFERENCE.md
+!mobile/pubspec.yaml
+!mobile/lib/
+!configs/
+!.vscode/extensions.json
+!README.md
+!DEPENDENCY_MANAGEMENT.md
+!GIT_WORKFLOW.md
+!QUICK_START_GIT_HYGIENE.md
+!GIT_HYGIENE_SETUP.md
+!GIT_HYGIENE_MASTER_REFERENCE.md
+!setup.py
+!setup.cfg
+!pyproject.toml
+!pubspec.yaml
+!.github/workflows/
+
+# ============================================================================
+# END OF GITIGNORE
+# ============================================================================
