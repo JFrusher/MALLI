@@ -336,12 +336,91 @@ def compute_square_box(
     roi_size: int,
     width: int,
     height: int,
+    contour_width: int | None = None,
+    contour_height: int | None = None,
+    contour_area: float | None = None,
+    scale_factor: float = 1.6,
+    min_box_size: int | None = None,
+    max_box_size: int | None = None,
 ) -> tuple[int, int, int, int]:
-    half = roi_size // 2
+    dynamic_size = int(roi_size)
+    if contour_width is not None and contour_height is not None:
+        dynamic_size = max(dynamic_size, int(max(contour_width, contour_height) * scale_factor))
+    if contour_area is not None and contour_area > 0.0:
+        equivalent_diameter = int(((4.0 * contour_area) / np.pi) ** 0.5 * scale_factor)
+        dynamic_size = max(dynamic_size, equivalent_diameter)
+
+    if min_box_size is not None:
+        dynamic_size = max(dynamic_size, int(min_box_size))
+    if max_box_size is not None:
+        dynamic_size = min(dynamic_size, int(max_box_size))
+
+    dynamic_size = max(8, dynamic_size)
+    half = dynamic_size // 2
     x1 = centroid_x - half
     y1 = centroid_y - half
-    x2 = x1 + roi_size
-    y2 = y1 + roi_size
+    x2 = x1 + dynamic_size
+    y2 = y1 + dynamic_size
+
+    if x1 < 0:
+        x2 -= x1
+        x1 = 0
+    if y1 < 0:
+        y2 -= y1
+        y1 = 0
+    if x2 > width:
+        shift = x2 - width
+        x1 = max(0, x1 - shift)
+        x2 = width
+    if y2 > height:
+        shift = y2 - height
+        y1 = max(0, y1 - shift)
+        y2 = height
+
+    return x1, y1, x2, y2
+
+
+def compute_padded_box(
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    width: int,
+    height: int,
+    padding_ratio: float = 0.35,
+    min_box_size: int | None = None,
+    max_box_size: int | None = None,
+) -> tuple[int, int, int, int]:
+    pad = max(int(max(w, h) * padding_ratio), 6)
+
+    x1 = x - pad
+    y1 = y - pad
+    x2 = x + w + pad
+    y2 = y + h + pad
+
+    if min_box_size is not None:
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w < min_box_size:
+            delta = min_box_size - box_w
+            x1 -= delta // 2
+            x2 += delta - (delta // 2)
+        if box_h < min_box_size:
+            delta = min_box_size - box_h
+            y1 -= delta // 2
+            y2 += delta - (delta // 2)
+
+    if max_box_size is not None:
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w > max_box_size:
+            shrink = box_w - max_box_size
+            x1 += shrink // 2
+            x2 -= shrink - (shrink // 2)
+        if box_h > max_box_size:
+            shrink = box_h - max_box_size
+            y1 += shrink // 2
+            y2 -= shrink - (shrink // 2)
 
     if x1 < 0:
         x2 -= x1
@@ -367,8 +446,18 @@ def extract_roi_proposals(
     roi_size: int = 128,
     min_blob_area: float = 80.0,
     max_blob_area: float = 50_000.0,
+    padding_ratio: float = 0.35,
+    min_box_size: int | None = None,
+    max_box_size: int | None = None,
+    min_extent: float = 0.18,
+    min_solidity: float = 0.45,
+    max_aspect_ratio: float = 4.0,
 ) -> list[RoiProposal]:
-    """Extract centroid-centered square ROI proposals from contour blobs."""
+    """Extract centroid-centered square ROI proposals from contour blobs.
+
+    The ROI size is dynamic: roi_size acts as a minimum, and larger blobs can
+    produce larger crops so we do not force every cell into the same box size.
+    """
 
     height, width = image_shape[:2]
     contours, _ = cv2.findContours(cell_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -379,13 +468,39 @@ def extract_roi_proposals(
         if area < min_blob_area or area > max_blob_area:
             continue
 
+        x, y, w, h = cv2.boundingRect(contour)
+        bbox_area = float(max(1, w * h))
+        extent = area / bbox_area
+        aspect_ratio = max(float(w) / max(1.0, float(h)), float(h) / max(1.0, float(w)))
+
+        hull = cv2.convexHull(contour)
+        hull_area = float(cv2.contourArea(hull))
+        solidity = area / max(1.0, hull_area)
+
+        if extent < min_extent:
+            continue
+        if solidity < min_solidity:
+            continue
+        if aspect_ratio > max_aspect_ratio:
+            continue
+
         moments = cv2.moments(contour)
         if moments["m00"] == 0:
             continue
 
         cx = int(moments["m10"] / moments["m00"])
         cy = int(moments["m01"] / moments["m00"])
-        box = compute_square_box(cx, cy, roi_size=roi_size, width=width, height=height)
+        box = compute_padded_box(
+            x,
+            y,
+            w,
+            h,
+            width=width,
+            height=height,
+            padding_ratio=padding_ratio,
+            min_box_size=min_box_size or roi_size,
+            max_box_size=max_box_size,
+        )
         proposals.append(RoiProposal(box=box, centroid=(cx, cy), area=area))
 
     return proposals
@@ -480,18 +595,26 @@ def draw_overlay(
 ) -> np.ndarray:
     overlay = image_bgr.copy()
 
+    def confidence_to_bgr(confidence: float) -> tuple[int, int, int]:
+        value = int(round(float(np.clip(confidence, 0.0, 1.0)) * 255.0))
+        color = cv2.applyColorMap(np.array([[value]], dtype=np.uint8), cv2.COLORMAP_TURBO)[0, 0]
+        return int(color[0]), int(color[1]), int(color[2])
+
     for idx, proposal in enumerate(proposals):
         x1, y1, x2, y2 = proposal.box
         if idx in kept_positive_indices:
-            color = (0, 0, 255)
+            confidence_value = float(probabilities[idx]) if probabilities.size > idx else threshold
+            color = confidence_to_bgr(confidence_value)
             label_text = f"INF {probabilities[idx]:.2f}"
         elif probabilities[idx] >= threshold:
             continue
         else:
-            color = (0, 255, 0)
+            confidence_value = float(probabilities[idx]) if probabilities.size > idx else 0.0
+            color = confidence_to_bgr(confidence_value)
             label_text = f"HLT {probabilities[idx]:.2f}"
 
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+        thickness = 1 + int(round(float(probabilities[idx]) * 3.0)) if probabilities.size > idx else 2
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(
             overlay,
             label_text,

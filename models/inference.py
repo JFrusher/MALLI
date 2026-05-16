@@ -6,6 +6,7 @@ Optimized for M.A.L.L.I. to handle both .keras (full models) and .h5 (weights).
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Tuple, List
@@ -55,23 +56,23 @@ def load_model_with_weights(
     # 1. Always build the skeleton first so we have a target for the weights
     model = build_mobilenetv3_small(input_shape=input_shape)
     
-    print(f"DEBUG: Attempting to load weights into architecture from {path}")
+    logging.debug("Attempting to load weights into architecture from %s", path)
     
     try:
         # 2. Load weights by TOPOLOGY (by_name=False)
         # This is the "magic fix" for the UserWarnings you're seeing.
         # It maps weights based on the order of layers rather than their string names.
         model.load_weights(path, by_name=False, skip_mismatch=False)
-        print("✅ Weights loaded successfully via topology mapping.")
+        logging.info("Weights loaded successfully via topology mapping.")
         
     except Exception as e:
-        print(f"⚠️ Topology load failed: {e}. Trying flexible name match...")
+        logging.warning("Topology load failed for %s: %s. Trying flexible name match.", path, e)
         try:
             # Fallback: if topology fails, try name matching but skip what doesn't fit
             model.load_weights(path, by_name=True, skip_mismatch=True)
-            print("✅ Weights loaded via flexible name matching.")
+            logging.info("Weights loaded via flexible name matching.")
         except Exception as e2:
-            print(f"❌ Critical Failure: Could not load weights: {e2}")
+            logging.error("Critical failure loading weights from %s: %s", path, e2)
 
     if compile_model:
         model.compile(

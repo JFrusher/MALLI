@@ -11,13 +11,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import List
 import argparse
+import json
 import logging
 import math
+import os
 import sys
 import time
 import tempfile
 import shutil
-import os
 import zipfile
 
 import numpy as np
@@ -38,6 +39,7 @@ from .roi_grabber import (
     non_max_suppression,
 )
 from .inference import load_model_with_weights
+from .model_factory import build_mobilenetv3_small
 
 
 def setup_logging(verbose: bool) -> None:
@@ -73,6 +75,140 @@ def print_progress(current: int, total: int, started_at: float, prefix: str = "P
     print(msg, end="", file=sys.stderr, flush=True)
     if current >= total:
         print(file=sys.stderr, flush=True)
+
+
+def cohen_d(sample_a: list[float], sample_b: list[float]) -> float:
+    if not sample_a or not sample_b:
+        return 0.0
+    mean_a = float(np.mean(sample_a))
+    mean_b = float(np.mean(sample_b))
+    var_a = float(np.var(sample_a, ddof=1)) if len(sample_a) > 1 else 0.0
+    var_b = float(np.var(sample_b, ddof=1)) if len(sample_b) > 1 else 0.0
+    pooled_num = (len(sample_a) - 1) * var_a + (len(sample_b) - 1) * var_b
+    pooled_den = max(1, len(sample_a) + len(sample_b) - 2)
+    pooled_var = pooled_num / pooled_den
+    denom = math.sqrt(max(1e-12, pooled_var))
+    return (mean_a - mean_b) / denom
+
+
+def percentile_summary(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"min": 0.0, "q25": 0.0, "median": 0.0, "q75": 0.0, "max": 0.0}
+    arr = np.asarray(values, dtype=np.float32)
+    return {
+        "min": float(np.min(arr)),
+        "q25": float(np.percentile(arr, 25)),
+        "median": float(np.median(arr)),
+        "q75": float(np.percentile(arr, 75)),
+        "max": float(np.max(arr)),
+    }
+
+
+def build_summary_row(items: list[dict], name: str) -> dict[str, float | int | str]:
+    paras = [float(it["parasitemia"]) for it in items]
+    totals = [int(it["total_cells"]) for it in items]
+    parasites = [int(it["parasites"]) for it in items]
+    avg_mnets = [float(it["avg_mnet_all"]) for it in items]
+    avg_pos_mnets = [float(it["avg_mnet_pos"]) for it in items if float(it["avg_mnet_pos"]) > 0.0]
+    avg_props = [float(it["avg_proposal_area"]) for it in items]
+    raw_counts = [int(it["raw_proposal_count"]) for it in items]
+
+    para_pct = percentile_summary(paras)
+    total_pct = percentile_summary([float(v) for v in totals])
+    raw_pct = percentile_summary([float(v) for v in raw_counts])
+
+    zero_cells = sum(1 for t in totals if t == 0)
+    zero_parasitemia = sum(1 for p in paras if p == 0.0)
+    any_parasites = sum(1 for p in parasites if p > 0)
+
+    return {
+        "group": name,
+        "images": len(items),
+        "mean_parasitemia": float(np.mean(paras)) if paras else 0.0,
+        "median_parasitemia": para_pct["median"],
+        "std_parasitemia": float(np.std(paras)) if len(paras) > 1 else 0.0,
+        "min_parasitemia": para_pct["min"],
+        "q25_parasitemia": para_pct["q25"],
+        "q75_parasitemia": para_pct["q75"],
+        "max_parasitemia": para_pct["max"],
+        "mean_total_cells": float(np.mean(totals)) if totals else 0.0,
+        "median_total_cells": total_pct["median"],
+        "mean_parasites": float(np.mean(parasites)) if parasites else 0.0,
+        "mean_avg_mnet": float(np.mean(avg_mnets)) if avg_mnets else 0.0,
+        "median_avg_mnet": float(np.median(avg_mnets)) if avg_mnets else 0.0,
+        "mean_avg_mnet_pos": float(np.mean(avg_pos_mnets)) if avg_pos_mnets else 0.0,
+        "mean_avg_proposal_area": float(np.mean(avg_props)) if avg_props else 0.0,
+        "mean_raw_proposal_count": float(np.mean(raw_counts)) if raw_counts else 0.0,
+        "median_raw_proposal_count": raw_pct["median"],
+        "pct_zero_cells": 100.0 * zero_cells / len(items) if items else 0.0,
+        "pct_zero_parasitemia": 100.0 * zero_parasitemia / len(items) if items else 0.0,
+        "pct_any_parasites": 100.0 * any_parasites / len(items) if items else 0.0,
+    }
+
+
+def infer_input_size_from_keras_archive(model_path: Path) -> tuple[int, int] | None:
+    if not model_path.exists() or not zipfile.is_zipfile(model_path):
+        return None
+
+    with zipfile.ZipFile(model_path, "r") as archive:
+        try:
+            config = json.loads(archive.read("config.json"))
+        except Exception:
+            return None
+
+    layers = config.get("config", {}).get("layers", [])
+    for layer in layers:
+        if layer.get("class_name") != "InputLayer":
+            continue
+        batch_shape = layer.get("config", {}).get("batch_input_shape")
+        if isinstance(batch_shape, list) and len(batch_shape) >= 3:
+            return int(batch_shape[1]), int(batch_shape[2])
+    return None
+
+
+def load_diagnostic_model(model_path: Path, fallback_input_size: tuple[int, int]) -> tuple[tf.keras.Model, tuple[int, int]]:
+    if model_path.suffix.lower() == ".weights.h5" or model_path.name.endswith(".weights.h5"):
+        model = load_model_with_weights(
+            model_path,
+            input_shape=(fallback_input_size[0], fallback_input_size[1], 3),
+            compile_model=False,
+        )
+        return model, fallback_input_size
+
+    archive_input_size = infer_input_size_from_keras_archive(model_path)
+    input_size = archive_input_size or fallback_input_size
+
+    try:
+        model = tf.keras.models.load_model(str(model_path), compile=False, safe_mode=False)
+        return model, input_size
+    except Exception as exc:
+        logging.warning("Direct Keras loading failed for %s: %s", model_path, exc)
+
+    if zipfile.is_zipfile(model_path):
+        with zipfile.ZipFile(model_path, "r") as archive:
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".weights.h5") as tmpf:
+                    tmpf.write(archive.read("model.weights.h5"))
+                    weights_path = Path(tmpf.name)
+            except Exception as exc:
+                raise RuntimeError(f"Could not extract embedded weights from {model_path}: {exc}") from exc
+
+        try:
+            model = build_mobilenetv3_small(input_shape=(input_size[0], input_size[1], 3))
+            # The weights inside the Keras archive are name-matched against the
+            # rebuilt architecture to avoid the trackable-loading bug in tf_keras.
+            try:
+                model.load_weights(str(weights_path), by_name=True, skip_mismatch=True)
+            except TypeError:
+                model.load_weights(str(weights_path))
+            return model, input_size
+        finally:
+            try:
+                os.remove(weights_path)
+            except Exception:
+                pass
+
+    raise RuntimeError(f"Unsupported model format: {model_path}")
 
 
 def process_all(
@@ -189,81 +325,106 @@ def process_all(
 
 def summarize_and_plot(rows: list[dict], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Aggregate by group
+    # Aggregate by views that answer the actual evaluation questions.
     groups: dict[str, list[dict]] = {}
+    labels: dict[str, list[dict]] = {}
+    smears: dict[str, list[dict]] = {}
     for r in rows:
         groups.setdefault(r["group"], []).append(r)
+        labels.setdefault(r["label"], []).append(r)
+        smears.setdefault(r["smear"], []).append(r)
 
-    stats_rows = []
-    for grp, items in groups.items():
-        paras = [it["parasitemia"] for it in items]
-        totals = [it["total_cells"] for it in items]
-        avg_mnets = [it["avg_mnet_all"] for it in items]
-        avg_props = [it["avg_proposal_area"] for it in items]
-        pct_zero = 100.0 * sum(1 for t in totals if t == 0) / len(totals)
-        stats_rows.append(
-            {
-                "group": grp,
-                "images": len(items),
-                "mean_parasitemia": float(np.mean(paras)) if paras else 0.0,
-                "median_parasitemia": float(np.median(paras)) if paras else 0.0,
-                "mean_total_cells": float(np.mean(totals)) if totals else 0.0,
-                "mean_avg_mnet": float(np.mean(avg_mnets)) if avg_mnets else 0.0,
-                "mean_avg_proposal_area": float(np.mean(avg_props)) if avg_props else 0.0,
-                "pct_zero_cells": float(pct_zero),
-            }
-        )
-    # Write group stats CSV
-    stats_path = out_dir / "group_stats.csv"
-    with stats_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["group", "images", "mean_parasitemia", "median_parasitemia", "mean_total_cells", "mean_avg_mnet", "mean_avg_proposal_area", "pct_zero_cells"])
-        writer.writeheader()
-        for r in stats_rows:
-            writer.writerow(r)
+    overall_stats = build_summary_row(rows, "all")
+    group_stats = [build_summary_row(items, grp) for grp, items in sorted(groups.items())]
+    label_stats = [build_summary_row(items, label) for label, items in sorted(labels.items())]
+    smear_stats = [build_summary_row(items, smear) for smear, items in sorted(smears.items())]
 
-    # Plots using matplotlib only (avoid seaborn dependency)
+    # Write CSV breakdowns.
+    def write_csv(path: Path, payload: list[dict[str, float | int | str]]) -> None:
+        if not payload:
+            return
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(payload[0].keys()))
+            writer.writeheader()
+            for row in payload:
+                writer.writerow(row)
+
+    write_csv(out_dir / "group_stats.csv", group_stats)
+    write_csv(out_dir / "label_stats.csv", label_stats)
+    write_csv(out_dir / "smear_stats.csv", smear_stats)
+
+    # Plots using matplotlib only.
+    def boxplot_by_key(key: str, title: str, file_name: str, order: list[str]) -> None:
+        series = [[r["parasitemia"] for r in (groups.get(k) if key == "group" else labels.get(k) if key == "label" else smears.get(k))] for k in order]
+        plt.figure(figsize=(max(10, 0.8 * len(order)), 6))
+        plt.boxplot(series, labels=order, showmeans=True)
+        plt.xticks(rotation=45, ha="right")
+        plt.ylabel("parasitemia")
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(out_dir / file_name)
+        plt.close()
+
+    def hist_by_key(key: str, title: str, file_name: str, order: list[str]) -> None:
+        plt.figure(figsize=(11, 6))
+        bins = np.linspace(0, max(1.0, float(max((r["parasitemia"] for r in rows), default=0.0))), 20)
+        alpha = 0.45
+        cmap = plt.get_cmap("tab10")
+        for i, k in enumerate(order):
+            series = [r["parasitemia"] for r in (groups.get(k) if key == "group" else labels.get(k) if key == "label" else smears.get(k))]
+            if not series:
+                continue
+            plt.hist(series, bins=bins, alpha=alpha, color=cmap(i % 10), label=k, density=True)
+        plt.xlabel("parasitemia")
+        plt.ylabel("density")
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / file_name)
+        plt.close()
+
     group_names = sorted(groups.keys())
-    paras_by_group = [[r["parasitemia"] for r in groups[g]] for g in group_names]
-    total_by_group = [[r["total_cells"] for r in groups[g]] for g in group_names]
-    avg_mnet_by_group = [[r["avg_mnet_all"] for r in groups[g]] for g in group_names]
-    raw_proposal_by_group = [[r["raw_proposal_count"] for r in groups[g]] for g in group_names]
+    label_names = sorted(labels.keys())
+    smear_names = sorted(smears.keys())
 
-    plt.figure(figsize=(10, 6))
-    plt.boxplot(paras_by_group, labels=group_names)
-    plt.xticks(rotation=45, ha="right")
-    plt.title("Parasitemia distribution by group")
-    plt.tight_layout()
-    plt.savefig(out_dir / "parasitemia_by_group_box.png")
-    plt.close()
+    boxplot_by_key("group", "Parasitemia distribution by smear/label group", "parasitemia_by_group_box.png", group_names)
+    boxplot_by_key("label", "Parasitemia distribution by label", "parasitemia_by_label_box.png", label_names)
+    boxplot_by_key("smear", "Parasitemia distribution by smear type", "parasitemia_by_smear_box.png", smear_names)
 
+    hist_by_key("group", "Parasitemia density by group", "parasitemia_by_group_hist.png", group_names)
+    hist_by_key("label", "Parasitemia density by label", "parasitemia_by_label_hist.png", label_names)
+    hist_by_key("smear", "Parasitemia density by smear type", "parasitemia_by_smear_hist.png", smear_names)
+
+    # Cell-count and score plots.
     plt.figure(figsize=(10, 6))
-    plt.boxplot(total_by_group, labels=group_names)
+    plt.boxplot([[r["total_cells"] for r in groups[g]] for g in group_names], labels=group_names, showmeans=True)
     plt.xticks(rotation=45, ha="right")
+    plt.ylabel("total cells detected")
     plt.title("Detected cells per image by group")
     plt.tight_layout()
     plt.savefig(out_dir / "cells_per_image_by_group_box.png")
     plt.close()
 
     plt.figure(figsize=(10, 6))
-    plt.boxplot(avg_mnet_by_group, labels=group_names)
+    plt.boxplot([[r["avg_mnet_all"] for r in groups[g]] for g in group_names], labels=group_names, showmeans=True)
     plt.xticks(rotation=45, ha="right")
+    plt.ylabel("avg_mnet_all")
     plt.title("Average MobileNetV3 score per image by group")
     plt.tight_layout()
     plt.savefig(out_dir / "avg_mnet_by_group_box.png")
     plt.close()
 
-    # Scatter: parasitemia vs avg mnet, colored by group
     plt.figure(figsize=(10, 6))
     cmap = plt.get_cmap("tab10")
     for i, g in enumerate(group_names):
         grp_items = groups[g]
         x = [it["avg_mnet_all"] for it in grp_items]
         y = [it["parasitemia"] for it in grp_items]
-        plt.scatter(x, y, color=cmap(i % 10), label=g, alpha=0.7)
+        plt.scatter(x, y, color=cmap(i % 10), label=g, alpha=0.75, s=36)
     plt.xlabel("avg_mnet_all")
     plt.ylabel("parasitemia")
     plt.title("Parasitemia vs avg MobileNetV3 score (per image)")
-    plt.legend()
+    plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(out_dir / "parasitemia_vs_avg_mnet_scatter.png")
     plt.close()
@@ -273,32 +434,89 @@ def summarize_and_plot(rows: list[dict], out_dir: Path) -> None:
         grp_items = groups[g]
         x = [it["raw_proposal_count"] for it in grp_items]
         y = [it["parasitemia"] for it in grp_items]
-        plt.scatter(x, y, color=cmap(i % 10), label=g, alpha=0.7)
+        plt.scatter(x, y, color=cmap(i % 10), label=g, alpha=0.75, s=36)
     plt.xlabel("raw_proposal_count")
     plt.ylabel("parasitemia")
     plt.title("Parasitemia vs proposal count (per image)")
-    plt.legend()
+    plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(out_dir / "parasitemia_vs_proposal_count.png")
     plt.close()
 
-    # Save summary text
+    plt.figure(figsize=(10, 6))
+    for i, smear in enumerate(smear_names):
+        grp_items = smears[smear]
+        x = [it["total_cells"] for it in grp_items]
+        y = [it["parasitemia"] for it in grp_items]
+        plt.scatter(x, y, color=cmap(i % 10), label=smear, alpha=0.75, s=36)
+    plt.xlabel("total_cells")
+    plt.ylabel("parasitemia")
+    plt.title("Parasitemia vs detected cell count by smear type")
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_dir / "parasitemia_vs_cells_by_smear.png")
+    plt.close()
+
+    # Storytelling summary text with effect sizes and flags.
+    infected = labels.get("Infected", [])
+    uninfected = labels.get("Uninfected", [])
+    thick = smears.get("thick", [])
+    thin = smears.get("thin", [])
+
+    infected_paras = [float(r["parasitemia"]) for r in infected]
+    uninfected_paras = [float(r["parasitemia"]) for r in uninfected]
+    thick_paras = [float(r["parasitemia"]) for r in thick]
+    thin_paras = [float(r["parasitemia"]) for r in thin]
+
     txt = out_dir / "diagnostic_summary.txt"
     with txt.open("w", encoding="utf-8") as fh:
-        fh.write("Group-level stats summary:\n")
-        for r in stats_rows:
-            fh.write(str(r) + "\n")
-        fh.write("\nInvestigative notes:\n")
-        # Simple heuristics to flag potential issues
-        for r in stats_rows:
+        fh.write("Overall summary:\n")
+        fh.write(str(overall_stats) + "\n\n")
+        fh.write("Interpretation targets:\n")
+        if infected_paras and uninfected_paras:
+            fh.write(
+                f"- Infected vs Uninfected parasitemia: mean {np.mean(infected_paras):.3f}% vs {np.mean(uninfected_paras):.3f}% | "
+                f"median {np.median(infected_paras):.3f}% vs {np.median(uninfected_paras):.3f}% | "
+                f"Cohen's d={cohen_d(infected_paras, uninfected_paras):.3f}\n"
+            )
+        if thick_paras and thin_paras:
+            fh.write(
+                f"- Thick vs Thin parasitemia: mean {np.mean(thick_paras):.3f}% vs {np.mean(thin_paras):.3f}% | "
+                f"median {np.median(thick_paras):.3f}% vs {np.median(thin_paras):.3f}% | "
+                f"Cohen's d={cohen_d(thick_paras, thin_paras):.3f}\n"
+            )
+        fh.write("\nGroup-level breakdown:\n")
+        for r in group_stats:
             notes = []
-            if r["mean_total_cells"] < 5:
-                notes.append("low detected cells (mean < 5)")
-            if r["mean_avg_mnet"] < 0.3:
-                notes.append("low classifier confidence (mean mnet < 0.3)")
-            if r["pct_zero_cells"] > 50.0:
-                notes.append("many images with zero detected cells (>50%)")
-            fh.write(f"- {r['group']}: {', '.join(notes) if notes else 'no obvious flags'}\n")
+            if float(r["mean_total_cells"]) < 5:
+                notes.append("low detected cells")
+            if float(r["pct_zero_cells"]) > 50.0:
+                notes.append("many zero-cell images")
+            if float(r["mean_avg_mnet"]) < 0.3:
+                notes.append("weak classifier confidence")
+            if float(r["pct_any_parasites"]) < 20.0 and r["group"].endswith("infected"):
+                notes.append("infected group rarely crosses threshold")
+            fh.write(f"- {r['group']}: mean parasitemia={r['mean_parasitemia']:.3f}%, median={r['median_parasitemia']:.3f}%, mean cells={r['mean_total_cells']:.2f}, mean mnet={r['mean_avg_mnet']:.3f}, notes={'; '.join(notes) if notes else 'ok'}\n")
+        fh.write("\nSmear-type breakdown:\n")
+        for r in smear_stats:
+            fh.write(f"- {r['group']}: {r}\n")
+        fh.write("\nLabel breakdown:\n")
+        for r in label_stats:
+            fh.write(f"- {r['group']}: {r}\n")
+
+    # Save combined JSON for downstream inspection.
+    summary_json = {
+        "overall": overall_stats,
+        "groups": group_stats,
+        "labels": label_stats,
+        "smears": smear_stats,
+        "effect_sizes": {
+            "infected_vs_uninfected_parasitemia_d": cohen_d(infected_paras, uninfected_paras),
+            "thick_vs_thin_parasitemia_d": cohen_d(thick_paras, thin_paras),
+        },
+    }
+    with (out_dir / "diagnostic_summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(summary_json, fh, indent=2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -326,15 +544,11 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
 
-    # Load model once using the configured input size.
     logging.info("Loading model: %s", args.model_path)
-    if args.model_path.suffix.lower() == ".weights.h5" or args.model_path.name.endswith(".weights.h5"):
-        model = load_model_with_weights(args.model_path, input_shape=(args.model_input_size, args.model_input_size, 3), compile_model=False)
-    else:
-        try:
-            model = tf.keras.models.load_model(str(args.model_path), compile=False, safe_mode=False)
-        except TypeError:
-            model = tf.keras.models.load_model(str(args.model_path), compile=False)
+    model, resolved_model_input_size = load_diagnostic_model(
+        args.model_path,
+        fallback_input_size=(args.model_input_size, args.model_input_size),
+    )
 
     if args.dataset_root is not None and args.dataset_root.exists() and not args.use_zip:
         samples = crawl_dataverse_structure(args.dataset_root, thick_min_dim=512)
@@ -365,6 +579,9 @@ def main() -> None:
                     except Exception:
                         pass
 
+    if "temp_paths" not in locals():
+        temp_paths: list[str] = []
+
     try:
         logging.info("Discovered %d images to process", len(samples))
 
@@ -375,7 +592,7 @@ def main() -> None:
             model=model,
             threshold=args.threshold,
             roi_size=args.roi_size,
-            model_input_size=(args.model_input_size, args.model_input_size),
+            model_input_size=resolved_model_input_size,
             batch_size=args.batch_size,
             nms_iou=args.nms_iou,
             min_blob_area=args.min_blob_area,

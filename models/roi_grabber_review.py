@@ -12,18 +12,27 @@ from pathlib import Path
 from typing import Sequence
 import argparse
 import logging
+import traceback
 import random
 import zipfile
 import io
 import tempfile
 import shutil
 import os
+import time
 
 import cv2
 import numpy as np
 import tensorflow as tf
 
+# Suppress TensorFlow initialization warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress INFO and WARNING from TensorFlow
+tf.get_logger().setLevel("ERROR")  # Only show errors from TensorFlow logger
+
 from .inference import load_model_with_weights
+from .detection_pipeline import (
+    TilingInferenceEngine,
+)
 from .roi_grabber import (
     SUPPORTED_EXTENSIONS,
     batch_predict_rois,
@@ -99,6 +108,64 @@ def setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+
+def summarize_exception(exc: Exception, limit: int = 900) -> str:
+    message = f"{type(exc).__name__}: {exc}"
+    collapsed = " ".join(message.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 3] + "..."
+
+
+def load_model_from_keras_archive_weights(model_path: Path, input_size: tuple[int, int]) -> tf.keras.Model:
+    extracted_weights: Path | None = None
+    with zipfile.ZipFile(model_path, "r") as archive:
+        weight_members = [name for name in archive.namelist() if name.endswith(".weights.h5")]
+        if not weight_members:
+            raise RuntimeError(f"No embedded .weights.h5 file found inside {model_path.name}")
+
+        # Keras only allows name-based fallback loading on legacy .h5 files.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmpf:
+            tmpf.write(archive.read(weight_members[0]))
+            extracted_weights = Path(tmpf.name)
+
+    try:
+        return load_model_with_weights(
+            extracted_weights,
+            input_shape=(input_size[0], input_size[1], 3),
+            compile_model=False,
+        )
+    finally:
+        try:
+            if extracted_weights is not None:
+                extracted_weights.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def offset_variant_proposal(
+    variant_proposal: VariantProposal,
+    offset_x: int,
+    offset_y: int,
+    image_width: int,
+    image_height: int,
+) -> VariantProposal:
+    x1, y1, x2, y2 = variant_proposal.proposal.box
+    mapped_box = (
+        max(0, min(image_width, x1 + offset_x)),
+        max(0, min(image_height, y1 + offset_y)),
+        max(0, min(image_width, x2 + offset_x)),
+        max(0, min(image_height, y2 + offset_y)),
+    )
+    mapped_centroid = (
+        max(0, min(image_width - 1, variant_proposal.proposal.centroid[0] + offset_x)),
+        max(0, min(image_height - 1, variant_proposal.proposal.centroid[1] + offset_y)),
+    )
+    return VariantProposal(
+        variant=variant_proposal.variant,
+        proposal=RoiProposal(box=mapped_box, centroid=mapped_centroid, area=variant_proposal.proposal.area),
     )
 
 
@@ -206,51 +273,92 @@ def crawl_zip_samples(zip_path: Path, thick_min_dim: int) -> list[ReviewSample]:
             if ext != ".zip":
                 continue
 
-            # Stream nested zip entry to disk to avoid memory blowup.
-            with archive.open(info.filename) as nested_fp:
-                tmpf = tempfile.NamedTemporaryFile(delete=False)
-                try:
-                    shutil.copyfileobj(nested_fp, tmpf)
-                    tmpf.close()
-                    with zipfile.ZipFile(tmpf.name, "r") as nested:
-                        for nested_info in nested.infolist():
-                            if nested_info.is_dir():
-                                continue
-                            nested_entry = Path(nested_info.filename)
-                            if nested_entry.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                                continue
+            # Stream nested zip to memory (BytesIO) to avoid disk space issues.
+            # Falls back to disk temp file if memory is insufficient.
+            try:
+                with archive.open(info.filename) as nested_fp:
+                    nested_bytes = io.BytesIO(nested_fp.read())
+                with zipfile.ZipFile(nested_bytes, "r") as nested:
+                    for nested_info in nested.infolist():
+                        if nested_info.is_dir():
+                            continue
+                        nested_entry = Path(nested_info.filename)
+                        if nested_entry.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                            continue
 
-                            combined_parts = [part.lower() for part in entry.parts] + [
-                                part.lower() for part in nested_entry.parts
-                            ]
-                            label = infer_label_from_parts(combined_parts)
-                            if label is None:
+                        combined_parts = [part.lower() for part in entry.parts] + [
+                            part.lower() for part in nested_entry.parts
+                        ]
+                        label = infer_label_from_parts(combined_parts)
+                        if label is None:
+                            continue
+
+                        smear = infer_smear_type_from_parts(combined_parts)
+                        if smear is None:
+                            image = read_image_from_zip(nested, nested_info.filename)
+                            if image is None:
                                 continue
+                            h, w = image.shape[:2]
+                            smear = infer_smear_type_by_dimensions(h, w, thick_min_dim=thick_min_dim)
 
-                            smear = infer_smear_type_from_parts(combined_parts)
-                            if smear is None:
-                                image = read_image_from_zip(nested, nested_info.filename)
-                                if image is None:
-                                    continue
-                                h, w = image.shape[:2]
-                                smear = infer_smear_type_by_dimensions(h, w, thick_min_dim=thick_min_dim)
-
-                            group = infer_group_key(combined_parts, fallback_name=entry.stem)
-                            samples.append(
-                                ReviewSample(
-                                    source_type="nested_zip",
-                                    source_id=make_nested_source_id(info.filename, nested_info.filename),
-                                    group_key=group,
-                                    coverage_key=make_coverage_key(label, smear),
-                                    label_name=label,
-                                    smear_type=smear,
-                                )
+                        group = infer_group_key(combined_parts, fallback_name=entry.stem)
+                        samples.append(
+                            ReviewSample(
+                                source_type="nested_zip",
+                                source_id=make_nested_source_id(info.filename, nested_info.filename),
+                                group_key=group,
+                                coverage_key=make_coverage_key(label, smear),
+                                label_name=label,
+                                smear_type=smear,
                             )
-                finally:
+                        )
+            except MemoryError:
+                # Fallback to disk if nested zip is too large for memory
+                logging.warning(f"Nested zip too large for memory, using disk temp: {info.filename}")
+                with archive.open(info.filename) as nested_fp:
+                    tmpf = tempfile.NamedTemporaryFile(delete=False)
                     try:
-                        os.remove(tmpf.name)
-                    except Exception:
-                        pass
+                        shutil.copyfileobj(nested_fp, tmpf)
+                        tmpf.close()
+                        with zipfile.ZipFile(tmpf.name, "r") as nested:
+                            for nested_info in nested.infolist():
+                                if nested_info.is_dir():
+                                    continue
+                                nested_entry = Path(nested_info.filename)
+                                if nested_entry.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                                    continue
+
+                                combined_parts = [part.lower() for part in entry.parts] + [
+                                    part.lower() for part in nested_entry.parts
+                                ]
+                                label = infer_label_from_parts(combined_parts)
+                                if label is None:
+                                    continue
+
+                                smear = infer_smear_type_from_parts(combined_parts)
+                                if smear is None:
+                                    image = read_image_from_zip(nested, nested_info.filename)
+                                    if image is None:
+                                        continue
+                                    h, w = image.shape[:2]
+                                    smear = infer_smear_type_by_dimensions(h, w, thick_min_dim=thick_min_dim)
+
+                                group = infer_group_key(combined_parts, fallback_name=entry.stem)
+                                samples.append(
+                                    ReviewSample(
+                                        source_type="nested_zip",
+                                        source_id=make_nested_source_id(info.filename, nested_info.filename),
+                                        group_key=group,
+                                        coverage_key=make_coverage_key(label, smear),
+                                        label_name=label,
+                                        smear_type=smear,
+                                    )
+                                )
+                    finally:
+                        try:
+                            os.remove(tmpf.name)
+                        except Exception:
+                            pass
     return samples
 
 
@@ -442,12 +550,19 @@ def draw_variant_overlay(
             label_parts.append("INF" if classifier_score >= (display_threshold if display_threshold is not None else 0.3) else "HLT")
 
         label = " | ".join(label_parts)
-        thickness = 4 if idx in positive_indices else 2 if idx in kept_indices else 1
-        color = variant_proposal.variant.color
+        confidence_value = 0.0
         if classifier_score is not None:
-            color = confidence_to_bgr(classifier_score, display_threshold if display_threshold is not None else 0.3)
+            confidence_value = classifier_score
         elif proposal_score is not None:
-            color = confidence_to_bgr(proposal_score, 0.5)
+            confidence_value = proposal_score
+
+        color = confidence_to_bgr(confidence_value)
+        if idx in positive_indices:
+            thickness = 2 + int(round(confidence_value * 3))
+        elif idx in kept_indices:
+            thickness = 1 + int(round(confidence_value * 2))
+        else:
+            thickness = 1
 
         text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
         text_bg_x2 = min(overlay.shape[1] - 1, x1 + text_size[0] + 6)
@@ -525,17 +640,165 @@ def build_roi_analysis_lines(
     return lines
 
 
-def confidence_to_bgr(confidence: float, threshold: float) -> tuple[int, int, int]:
-    """Map confidence to a visible BGR color."""
-    conf = float(np.clip(confidence, 0.0, 1.0))
-    low = float(np.clip(threshold, 0.01, 0.99))
-    if conf <= low:
-        return (0, 165, 255)
-    ratio = (conf - low) / max(1e-6, 1.0 - low)
-    ratio = float(np.clip(ratio, 0.0, 1.0))
-    red = int(round(255 * (1.0 - ratio)))
-    green = int(round(255 * ratio))
-    return (0, green, red)
+def confidence_to_bgr(confidence: float) -> tuple[int, int, int]:
+    """Map confidence to a vivid heatmap color."""
+    value = int(round(float(np.clip(confidence, 0.0, 1.0)) * 255.0))
+    color = cv2.applyColorMap(np.array([[value]], dtype=np.uint8), cv2.COLORMAP_TURBO)[0, 0]
+    return int(color[0]), int(color[1]), int(color[2])
+
+
+def compute_overlay_sahi_pipeline(
+    image: np.ndarray,
+    smear_type: str,
+    model: tf.keras.Model | None,
+    threshold: float,
+    tile_size: int,
+    overlap_ratio: float,
+    roi_size: int,
+    min_blob_area: float,
+    max_blob_area: float,
+    nms_threshold: float,
+    model_input_size: tuple[int, int],
+    batch_size: int,
+    max_roi_analysis_lines: int,
+) -> tuple[np.ndarray, int, int, float, list[str], list[str]]:
+    """Compute overlay using a tiled variant of the existing sensing pipeline.
+
+    SAHI is most useful here as a proposal-expansion layer: tile the image, run the
+    same sensing variants on each tile, merge proposals across tile boundaries,
+    then classify the deduplicated ROIs once on the full image.
+    """
+    tiler = TilingInferenceEngine(tile_size=tile_size, overlap_ratio=overlap_ratio)
+
+    # Build tile-local sensing proposals using the same segmentation logic as the
+    # baseline pipeline, then map them back into full-image coordinates.
+    # Reflect padding reduces tile-edge artifacts; explicit edge rejection keeps
+    # duplicate fragments from winning over centered, complete cells.
+    variants = sensing_variants_for_smear(smear_type)
+    all_variant_proposals: list[VariantProposal] = []
+    proposal_quality_scores: list[float] = []
+    raw_counts: Counter[str] = Counter()
+    edge_margin = max(roi_size // 2, int(tile_size * overlap_ratio * 0.35))
+    pad = edge_margin
+
+    for tile_info in tiler.generate_tiles(image.shape[0], image.shape[1]):
+        tile_x = tile_info["x"]
+        tile_y = tile_info["y"]
+        tile_w = tile_info["width"]
+        tile_h = tile_info["height"]
+        tile_crop = image[tile_y:tile_y + tile_h, tile_x:tile_x + tile_w]
+        if tile_crop.size == 0:
+            continue
+        tile = cv2.copyMakeBorder(
+            tile_crop,
+            pad,
+            pad,
+            pad,
+            pad,
+            borderType=cv2.BORDER_REFLECT_101,
+        )
+
+        for variant in variants:
+            proposals = extract_variant_proposals(
+                image=tile,
+                variant=variant,
+                smear_type=smear_type,
+                roi_size=roi_size,
+                min_blob_area=min_blob_area,
+                max_blob_area=max_blob_area,
+            )
+            raw_counts[variant.name] += len(proposals)
+            for proposal in proposals:
+                local_cx = proposal.proposal.centroid[0] - pad
+                local_cy = proposal.proposal.centroid[1] - pad
+
+                # Keep proposals that are sufficiently far from internal tile edges.
+                # Edge-touching proposals are usually fragments that overlap with a
+                # better centered copy in a neighboring tile.
+                if tile_x > 0 and local_cx < edge_margin:
+                    continue
+                if tile_y > 0 and local_cy < edge_margin:
+                    continue
+                if tile_x + tile_w < image.shape[1] and local_cx > (tile_w - edge_margin):
+                    continue
+                if tile_y + tile_h < image.shape[0] and local_cy > (tile_h - edge_margin):
+                    continue
+
+                mapped = offset_variant_proposal(
+                    proposal,
+                    tile_x - pad,
+                    tile_y - pad,
+                    image.shape[1],
+                    image.shape[0],
+                )
+                edge_distance = min(
+                    max(0.0, local_cx),
+                    max(0.0, local_cy),
+                    max(0.0, tile_w - local_cx),
+                    max(0.0, tile_h - local_cy),
+                )
+                center_bias = 1.0 + (edge_distance / max(1.0, float(edge_margin)))
+                all_variant_proposals.append(mapped)
+                proposal_quality_scores.append(float(proposal.proposal.area) * center_bias)
+
+    if not all_variant_proposals:
+        return image.copy(), 0, 0, 0.0, build_variant_legend(variants, raw_counts, Counter(), Counter(), model is not None), []
+
+    # Post-processing across tile boundaries before classification keeps the model
+    # from seeing duplicate crops multiple times.
+    boxes = np.array([proposal.proposal.box for proposal in all_variant_proposals], dtype=np.float32)
+    quality_scores = np.array(proposal_quality_scores, dtype=np.float32)
+    kept_indices_list = non_max_suppression(boxes, quality_scores, iou_threshold=nms_threshold)
+    kept_variant_proposals = [all_variant_proposals[idx] for idx in kept_indices_list]
+
+    if model is None:
+        probabilities = None
+    else:
+        probabilities = batch_predict_rois(
+            model=model,
+            image_bgr=image,
+            proposals=[proposal.proposal for proposal in kept_variant_proposals],
+            model_input_size=model_input_size,
+            batch_size=batch_size,
+        )
+
+    kept_indices = set(range(len(kept_variant_proposals)))
+    positive_indices: set[int] = set()
+    if probabilities is not None:
+        positive_indices = {idx for idx in kept_indices if float(probabilities[idx]) >= threshold}
+
+    kept_counts: Counter[str] = Counter()
+    positive_counts: Counter[str] = Counter()
+    for idx in kept_indices:
+        variant_name = kept_variant_proposals[idx].variant.name
+        kept_counts[variant_name] += 1
+    for idx in positive_indices:
+        variant_name = kept_variant_proposals[idx].variant.name
+        positive_counts[variant_name] += 1
+
+    overlay = draw_variant_overlay(
+        image_bgr=image,
+        proposals=kept_variant_proposals,
+        classifier_scores=probabilities,
+        proposal_scores=None,
+        kept_indices=kept_indices,
+        positive_indices=positive_indices,
+        display_threshold=threshold,
+    )
+
+    total_cells = len(kept_indices)
+    parasites = len(positive_indices)
+    parasitemia = (100.0 * parasites / total_cells) if total_cells > 0 else 0.0
+    legend_lines = build_variant_legend(variants, raw_counts, kept_counts, positive_counts, model is not None)
+    analysis_lines = build_roi_analysis_lines(
+        proposals=kept_variant_proposals,
+        proposal_scores=None,
+        classifier_scores=probabilities,
+        kept_indices=list(range(len(kept_variant_proposals))),
+        threshold=threshold,
+        max_lines=max_roi_analysis_lines,
+    )
+    return overlay, total_cells, parasites, parasitemia, legend_lines, analysis_lines
 
 
 def compute_overlay(
@@ -554,7 +817,28 @@ def compute_overlay(
     yolo_conf: float = 0.3,
     yolo_nms_iou: float = 0.5,
     max_roi_analysis_lines: int = 10,
+    use_sahi: bool = False,
+    sahi_tile_size: int = 640,
+    sahi_overlap: float = 0.2,
+    sahi_nms_threshold: float = 0.5,
 ) -> tuple[np.ndarray, int, int, float, list[str], list[str]]:
+    # Use SAHI pipeline if requested
+    if use_sahi:
+        return compute_overlay_sahi_pipeline(
+            image=image,
+            smear_type=sample.smear_type,
+            model=model,
+            threshold=threshold,
+            tile_size=sahi_tile_size,
+            overlap_ratio=sahi_overlap,
+            roi_size=roi_size,
+            min_blob_area=min_blob_area,
+            max_blob_area=max_blob_area,
+            nms_threshold=sahi_nms_threshold,
+            model_input_size=model_input_size,
+            batch_size=batch_size,
+            max_roi_analysis_lines=max_roi_analysis_lines,
+        )
     variant_proposals: list[VariantProposal] = []
     raw_counts: Counter[str] = Counter()
     proposal_scores: np.ndarray | None = None
@@ -581,24 +865,50 @@ def compute_overlay(
                 variant_proposals.extend(proposals)
         else:
             # Use YOLO detections and represent them as a single "yolo" variant.
-            yolo_detections = yolov8_detect_detections(
-                image_bgr=image,
-                yolo_weights=yolo_weights,
-                conf_thresh=yolo_conf,
-                nms_iou=yolo_nms_iou,
-                roi_size=roi_size,
-            )
-            yolo_variant = SensingVariant("yolo", (0, 0, 255), 0, 0.0, 0.0, 0, 0, 0.0, 0)
-            raw_counts[yolo_variant.name] = len(yolo_detections)
-            variant_proposals = [
-                VariantProposal(
-                    variant=yolo_variant,
-                    proposal=RoiProposal(box=det.box, centroid=det.centroid, area=det.area),
+            # If the YOLO detection call fails at runtime (missing ultralytics, etc.)
+            # gracefully fall back to sensing variants instead of raising.
+            try:
+                yolo_detections = yolov8_detect_detections(
+                    image_bgr=image,
+                    yolo_weights=yolo_weights,
+                    conf_thresh=yolo_conf,
+                    nms_iou=yolo_nms_iou,
+                    roi_size=roi_size,
                 )
-                for det in yolo_detections
-            ]
-            proposal_scores = np.array([det.confidence for det in yolo_detections], dtype=np.float32)
-            variants = (yolo_variant,)
+            except Exception as exc:
+                logging.warning(
+                    "YOLO detection failed at runtime (%s). Falling back to sensing variants.",
+                    exc,
+                )
+                yolo_detections = None
+
+            if not yolo_detections:
+                # Fallback to original sensing variants when YOLO is unavailable or failed
+                variants = sensing_variants_for_smear(sample.smear_type)
+                for variant in variants:
+                    proposals = extract_variant_proposals(
+                        image=image,
+                        variant=variant,
+                        smear_type=sample.smear_type,
+                        roi_size=roi_size,
+                        min_blob_area=min_blob_area,
+                        max_blob_area=max_blob_area,
+                    )
+                    raw_counts[variant.name] = len(proposals)
+                    variant_proposals.extend(proposals)
+                proposal_scores = None
+            else:
+                yolo_variant = SensingVariant("yolo", (0, 0, 255), 0, 0.0, 0.0, 0, 0, 0.0, 0)
+                raw_counts[yolo_variant.name] = len(yolo_detections)
+                variant_proposals = [
+                    VariantProposal(
+                        variant=yolo_variant,
+                        proposal=RoiProposal(box=det.box, centroid=det.centroid, area=det.area),
+                    )
+                    for det in yolo_detections
+                ]
+                proposal_scores = np.array([det.confidence for det in yolo_detections], dtype=np.float32)
+                variants = (yolo_variant,)
     else:
         variants = sensing_variants_for_smear(sample.smear_type)
         for variant in variants:
@@ -721,7 +1031,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=Path("models/best_mobilenetv3_small.weights.h5"),
+        default=Path("models/last_mobilenetv3_small.keras"),
         help="MobileNetV3 weights or saved model path",
     )
     parser.add_argument("--disable-model", action="store_true", help="Show ROI boxes only, without classifier labels")
@@ -735,6 +1045,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-blob-area", type=float, default=50000.0, help="Maximum blob area")
     parser.add_argument("--save-dir", type=Path, default=Path("outputs/roi_review"), help="Directory for saved overlays")
     parser.add_argument("--window-name", type=str, default="MALLI ROI Reviewer", help="OpenCV window name")
+    parser.add_argument("--headless", action="store_true", default=True, help="Run in headless mode (save images, no GUI)")
+    parser.add_argument("--interactive", action="store_true", help="Run in interactive mode (requires display)")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logs")
     parser.add_argument("--use-yolo", action="store_true", help="Use YOLOv8 proposals instead of sensing variants")
     parser.add_argument("--yolo-weights", type=str, default="yolov8n.pt", help="YOLO weights path (default yolov8n.pt)")
@@ -746,25 +1058,141 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roboflow-version", type=int, default=1, help="Roboflow project version to download")
     parser.add_argument("--roboflow-download-dir", type=str, default=None, help="Local directory to download Roboflow export")
     parser.add_argument("--max-roi-analysis-lines", type=int, default=10, help="Maximum ROI analysis lines shown in the HUD")
+    # SAHI Pipeline arguments (new Dart-compatible pipeline)
+    parser.add_argument(
+        "--use-sahi-pipeline",
+        action="store_true",
+        help="Use tiled sensing pipeline (overlapping tiles + baseline ROI proposals + cross-tile NMS)",
+    )
+    parser.add_argument("--sahi-tile-size", type=int, default=640, help="SAHI tile size in pixels")
+    parser.add_argument("--sahi-overlap", type=float, default=0.2, help="SAHI tile overlap ratio (0.0-1.0)")
+    parser.add_argument("--sahi-nms-threshold", type=float, default=0.5, help="SAHI NMS IoU threshold")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     setup_logging(verbose=args.verbose)
+    
+    # Clean up stale temp files from previous runs to free disk space
+    temp_dir = Path(tempfile.gettempdir())
+    try:
+        import glob
+        stale_temp_files = glob.glob(str(temp_dir / "tmp*"))
+        cleaned_count = 0
+        for temp_file in stale_temp_files[:100]:  # Limit to avoid excessive I/O
+            try:
+                if os.path.isfile(temp_file):
+                    file_age_hours = (time.time() - os.path.getmtime(temp_file)) / 3600
+                    if file_age_hours > 1:  # Only remove files older than 1 hour
+                        os.remove(temp_file)
+                        cleaned_count += 1
+            except Exception:
+                pass
+        if cleaned_count > 0:
+            logging.info(f"Cleaned up {cleaned_count} stale temp files to free disk space")
+    except Exception as e:
+        logging.debug(f"Temp cleanup skipped: {e}")
 
     def load_review_model(model_path: Path, input_size: tuple[int, int]) -> tf.keras.Model:
+        logging.info(f"Model file exists: {model_path.exists()}, size: {model_path.stat().st_size if model_path.exists() else 'N/A'} bytes")
+        logging.debug(
+            "Model load context: path=%s suffix=%s input_size=%s tensorflow=%s",
+            model_path,
+            model_path.suffix,
+            input_size,
+            tf.__version__,
+        )
+        
         if model_path.suffix.lower() == ".weights.h5" or model_path.name.endswith(".weights.h5"):
+            logging.info("Loading model as .weights.h5 format")
             return load_model_with_weights(
                 model_path,
                 input_shape=(input_size[0], input_size[1], 3),
                 compile_model=False,
             )
 
+        logging.info(f"Loading model as {model_path.suffix} format using tf.keras.models.load_model()")
         try:
             return tf.keras.models.load_model(str(model_path), compile=False, safe_mode=False)
-        except TypeError:
-            return tf.keras.models.load_model(str(model_path), compile=False)
+        except TypeError as e:
+            logging.debug(f"First load attempt failed with TypeError (safe_mode not supported): {e}")
+            try:
+                return tf.keras.models.load_model(str(model_path), compile=False)
+            except Exception as fallback_exc:
+                logging.warning(
+                    "Direct model load failed for %s after safe_mode fallback: %s",
+                    model_path.name,
+                    summarize_exception(fallback_exc),
+                )
+                try:
+                    import tf_keras as legacy_keras
+                except ImportError:
+                    legacy_keras = None
+
+                if legacy_keras is not None:
+                    try:
+                        logging.info("Trying legacy tf_keras loader for %s", model_path.name)
+                        return legacy_keras.models.load_model(str(model_path), compile=False)
+                    except Exception as legacy_exc:
+                        logging.warning(
+                            "Legacy tf_keras load failed for %s: %s",
+                            model_path.name,
+                            summarize_exception(legacy_exc),
+                        )
+                if zipfile.is_zipfile(model_path):
+                    logging.info("Attempting rebuild-from-weights fallback for archive model %s", model_path.name)
+                    return load_model_from_keras_archive_weights(model_path, input_size)
+                raise
+        except Exception as e:
+            logging.warning(
+                "Direct model load failed for %s: %s",
+                model_path.name,
+                summarize_exception(e),
+            )
+            try:
+                import tf_keras as legacy_keras
+            except ImportError:
+                legacy_keras = None
+
+            if legacy_keras is not None:
+                try:
+                    logging.info("Trying legacy tf_keras loader for %s", model_path.name)
+                    return legacy_keras.models.load_model(str(model_path), compile=False)
+                except Exception as legacy_exc:
+                    logging.warning(
+                        "Legacy tf_keras load failed for %s: %s",
+                        model_path.name,
+                        summarize_exception(legacy_exc),
+                    )
+            if zipfile.is_zipfile(model_path):
+                logging.info("Attempting rebuild-from-weights fallback for archive model %s", model_path.name)
+                try:
+                    return load_model_from_keras_archive_weights(model_path, input_size)
+                except Exception as fallback_exc:
+                    logging.error(
+                        "Archive fallback failed for %s: %s",
+                        model_path.name,
+                        summarize_exception(fallback_exc),
+                    )
+                    if args.verbose:
+                        logging.debug(
+                            "Full model-load traceback for %s:\n%s",
+                            model_path.name,
+                            "".join(traceback.format_exception(type(fallback_exc), fallback_exc, fallback_exc.__traceback__)),
+                        )
+                    raise RuntimeError(
+                        f"Failed to load model archive {model_path.name}. See verbose logs for the full traceback."
+                    ) from fallback_exc
+            if args.verbose:
+                logging.debug(
+                    "Full model-load traceback for %s:\n%s",
+                    model_path.name,
+                    "".join(traceback.format_exception(type(e), e, e.__traceback__)),
+                )
+            raise RuntimeError(
+                f"Failed to load model {model_path.name}: {summarize_exception(e)}"
+            ) from e
 
     source_samples: list[ReviewSample]
     use_zip = bool(args.use_zip)
@@ -775,6 +1203,18 @@ def main() -> None:
             raise FileNotFoundError(
                 f"ZIP path not found: {args.zip_path}. Provide --dataset-root or a valid --zip-path."
             )
+        
+        # Check available disk space before processing large zips
+        zip_parent = args.zip_path.parent
+        disk_stats = shutil.disk_usage(str(zip_parent))
+        free_gb = disk_stats.free / (1024**3)
+        logging.info(f"Disk space available: {free_gb:.2f} GB on {zip_parent}")
+        if free_gb < 0.5:
+            logging.warning(
+                f"Warning: Only {free_gb:.2f} GB free on disk. Processing may fail during zip extraction. "
+                "Consider freeing space or moving to a larger disk."
+            )
+        
         source_samples = crawl_zip_samples(args.zip_path, thick_min_dim=args.thick_min_dim)
         use_zip = True
 
@@ -788,10 +1228,47 @@ def main() -> None:
     model: tf.keras.Model | None = None
     if not args.disable_model:
         logging.info("Loading model: %s", args.model_path)
+        if not args.model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {args.model_path.absolute()}")
         try:
             model = load_review_model(args.model_path, (args.model_input_size, args.model_input_size))
         except Exception as exc:
-            raise RuntimeError(f"Failed to load MobileNetV3 model from {args.model_path}: {exc}") from exc
+            logging.error(
+                "Model loading failed: %s. Re-run with --verbose for the full traceback.",
+                summarize_exception(exc),
+            )
+            
+            # Fallback: try alternative model format
+            fallback_path = None
+            if args.model_path.suffix == ".keras":
+                fallback_path = args.model_path.with_suffix(".weights.h5")
+            elif args.model_path.suffix == ".h5" and "weights" not in args.model_path.name:
+                fallback_path = Path(str(args.model_path).replace(".h5", ".weights.h5"))
+            
+            if fallback_path and fallback_path.exists():
+                logging.warning(f"Trying fallback model: {fallback_path}")
+                try:
+                    model = load_review_model(fallback_path, (args.model_input_size, args.model_input_size))
+                    logging.info(f"Successfully loaded fallback model: {fallback_path}")
+                except Exception as exc2:
+                    logging.error(
+                        "Fallback model also failed: %s",
+                        summarize_exception(exc2),
+                    )
+                    if args.verbose:
+                        logging.debug(
+                            "Full fallback traceback for %s:\n%s",
+                            fallback_path,
+                            "".join(traceback.format_exception(type(exc2), exc2, exc2.__traceback__)),
+                        )
+                    raise RuntimeError(
+                        f"Failed to load model (primary: {args.model_path}, fallback: {fallback_path}). "
+                        f"Error: {summarize_exception(exc)}"
+                    ) from exc
+            else:
+                raise RuntimeError(
+                    f"Failed to load MobileNetV3 model from {args.model_path}: {summarize_exception(exc)}"
+                ) from exc
 
     # If Roboflow credentials provided and YOLO usage requested, download weights
     if args.use_yolo and args.roboflow_api_key:
@@ -848,13 +1325,16 @@ def main() -> None:
         count = sum(1 for s in sampled if s.group_key == g)
         print(f"  - {g}: {count} samples")
     print(f"\nStarting with group: {active_group} ({len(visible)} visible)")
-    print("\nKeyboard controls:")
-    print("  n/d/→: Next image")
-    print("  p/a/←: Previous image")
-    print("  g: Cycle to next group")
-    print("  +/-: Adjust MobileNetV3 threshold")
-    print("  s: Save current overlay")
-    print("  q/ESC: Quit")
+    if args.interactive and not args.headless:
+        print("\nKeyboard controls:")
+        print("  n/d/→: Next image")
+        print("  p/a/←: Previous image")
+        print("  g: Cycle to next group")
+        print("  +/-: Adjust MobileNetV3 threshold")
+        print("  s: Save current overlay")
+        print("  q/ESC: Quit")
+    else:
+        print(f"\nHeadless mode: saving all overlays to {args.save_dir}")
     print("="*70 + "\n")
 
     zip_cache: zipfile.ZipFile | None = None
@@ -877,16 +1357,21 @@ def main() -> None:
                 finally:
                     pass
 
-    interactive_mode = True
-    try:
-        cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(args.window_name, 1400, 900)
-    except cv2.error as exc:
-        interactive_mode = False
-        logging.warning(
-            "OpenCV GUI support is unavailable; falling back to non-interactive export mode: %s",
-            exc,
-        )
+    interactive_mode = args.interactive and not args.headless
+    if interactive_mode:
+        try:
+            cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(args.window_name, 1400, 900)
+        except cv2.error as exc:
+            interactive_mode = False
+            logging.warning(
+                "OpenCV GUI support is unavailable; falling back to non-interactive export mode: %s",
+                exc,
+            )
+    else:
+        logging.info("Headless mode enabled: processing samples and saving overlays to %s", args.save_dir)
+    
+    if not interactive_mode:
         # In non-interactive mode, export all sampled items rather than just the
         # initially selected group so users get full coverage when GUI is missing.
         visible = list(range(len(sampled)))
@@ -931,6 +1416,10 @@ def main() -> None:
                 yolo_conf=args.yolo_conf,
                 yolo_nms_iou=args.yolo_nms_iou,
                 max_roi_analysis_lines=args.max_roi_analysis_lines,
+                use_sahi=args.use_sahi_pipeline,
+                sahi_tile_size=args.sahi_tile_size,
+                sahi_overlap=args.sahi_overlap,
+                sahi_nms_threshold=args.sahi_nms_threshold,
             )
 
             hud = annotate_hud(
