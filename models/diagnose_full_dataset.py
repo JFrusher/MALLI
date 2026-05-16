@@ -31,15 +31,9 @@ from .roi_grabber import (
     crawl_dataverse_zip,
     crawl_dataverse_structure,
     load_image_for_sample,
-    preprocess_for_segmentation,
-    segment_thick_smear_watershed,
-    segment_thin_smear,
-    extract_roi_proposals,
-    batch_predict_rois,
-    non_max_suppression,
 )
+from .roi_grabber_review import compute_overlay, load_model_from_keras_archive_weights
 from .inference import load_model_with_weights
-from .model_factory import build_mobilenetv3_small
 
 
 def setup_logging(verbose: bool) -> None:
@@ -200,28 +194,13 @@ def load_diagnostic_model(model_path: Path, fallback_input_size: tuple[int, int]
         logging.warning("Direct Keras loading failed for %s: %s", model_path, exc)
 
     if zipfile.is_zipfile(model_path):
-        with zipfile.ZipFile(model_path, "r") as archive:
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".weights.h5") as tmpf:
-                    tmpf.write(archive.read("model.weights.h5"))
-                    weights_path = Path(tmpf.name)
-            except Exception as exc:
-                raise RuntimeError(f"Could not extract embedded weights from {model_path}: {exc}") from exc
-
         try:
-            model = build_mobilenetv3_small(input_shape=(input_size[0], input_size[1], 3))
-            # The weights inside the Keras archive are name-matched against the
-            # rebuilt architecture to avoid the trackable-loading bug in tf_keras.
-            try:
-                model.load_weights(str(weights_path), by_name=True, skip_mismatch=True)
-            except TypeError:
-                model.load_weights(str(weights_path))
+            model = load_model_from_keras_archive_weights(model_path, input_size)
             return model, input_size
-        finally:
-            try:
-                os.remove(weights_path)
-            except Exception:
-                pass
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not rebuild model from embedded archive weights in {model_path}: {exc}"
+            ) from exc
 
     raise RuntimeError(f"Unsupported model format: {model_path}")
 
@@ -242,6 +221,15 @@ def process_all(
     overlay_dir: Path | None = None,
     limit: int = 0,
     progress_total: int | None = None,
+    use_yolo: bool = False,
+    yolo_weights: str | None = None,
+    yolo_conf: float = 0.3,
+    yolo_nms_iou: float = 0.5,
+    use_sahi_pipeline: bool = False,
+    sahi_tile_size: int = 640,
+    sahi_overlap: float = 0.2,
+    sahi_nms_threshold: float = 0.5,
+    min_display_score: float = 0.0,
 ):
     rows = []
     count = 0
@@ -259,59 +247,53 @@ def process_all(
             print_progress(processed_for_progress, total_for_progress, started_at)
             continue
 
-        pre = preprocess_for_segmentation(img)
-        if sample.smear_type == "thick":
-            mask = segment_thick_smear_watershed(img, pre)
-        else:
-            mask = segment_thin_smear(pre)
+        overlay, total_cells, parasites, parasitemia, _, _, details = compute_overlay(
+            sample=sample,
+            image=img,
+            model=model,
+            threshold=threshold,
+            roi_size=roi_size,
+            model_input_size=model_input_size,
+            batch_size=batch_size,
+            nms_iou_threshold=nms_iou,
+            min_blob_area=min_blob_area,
+            max_blob_area=max_blob_area,
+            use_yolo=use_yolo,
+            yolo_weights=yolo_weights,
+            yolo_conf=yolo_conf,
+            yolo_nms_iou=yolo_nms_iou,
+            max_roi_analysis_lines=0,
+            use_sahi=use_sahi_pipeline,
+            sahi_tile_size=sahi_tile_size,
+            sahi_overlap=sahi_overlap,
+            sahi_nms_threshold=sahi_nms_threshold,
+            min_display_score=min_display_score,
+            return_details=True,
+        )
 
-        proposals = extract_roi_proposals(mask, image_shape=img.shape, roi_size=roi_size, min_blob_area=min_blob_area, max_blob_area=max_blob_area)
-        proposal_areas = [p.area for p in proposals]
-        raw_proposal_count = len(proposals)
+        display_scores = np.asarray(details.get("display_scores", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+        display_areas = np.asarray(details.get("display_areas", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+        raw_proposal_count = int(details.get("raw_proposal_count", 0))
+        avg_proposal_area = float(np.mean(display_areas)) if display_areas.size > 0 else 0.0
 
-        if raw_proposal_count == 0:
-            avg_proposal_area = 0.0
-            probabilities = np.zeros((0,), dtype=np.float32)
-        else:
-            avg_proposal_area = float(np.mean(proposal_areas))
-            probabilities = batch_predict_rois(model=model, image_bgr=img, proposals=proposals, model_input_size=model_input_size, batch_size=batch_size)
-
-        # Positive indices and NMS on positives to get kept parasite detections
-        positive_mask = probabilities >= threshold if probabilities.size > 0 else np.array([], dtype=bool)
-        positive_indices = np.where(positive_mask)[0] if probabilities.size > 0 else np.array([], dtype=int)
-        kept_positive_set = set()
-        if positive_indices.size > 0:
-            pos_boxes = np.array([proposals[i].box for i in positive_indices], dtype=np.float32)
-            pos_scores = probabilities[positive_indices]
-            kept_rel = non_max_suppression(pos_boxes, pos_scores, iou_threshold=nms_iou)
-            kept_positive_set = {int(positive_indices[r]) for r in kept_rel}
-
-        total_cells = raw_proposal_count
-        parasites = len(kept_positive_set)
-        parasitemia = (100.0 * parasites / total_cells) if total_cells > 0 else 0.0
-
-        avg_mnet_all = float(np.mean(probabilities)) if probabilities.size > 0 else 0.0
-        avg_mnet_pos = float(np.mean(probabilities[positive_indices])) if positive_indices.size > 0 else 0.0
-        median_mnet = float(np.median(probabilities)) if probabilities.size > 0 else 0.0
-        std_mnet = float(np.std(probabilities)) if probabilities.size > 0 else 0.0
-        max_mnet = float(np.max(probabilities)) if probabilities.size > 0 else 0.0
-        p95_mnet = float(np.percentile(probabilities, 95)) if probabilities.size > 0 else 0.0
-        count_mnet_ge_0_1 = int(np.sum(probabilities >= 0.1)) if probabilities.size > 0 else 0
-        count_mnet_ge_0_2 = int(np.sum(probabilities >= 0.2)) if probabilities.size > 0 else 0
-        count_mnet_ge_0_3 = int(np.sum(probabilities >= 0.3)) if probabilities.size > 0 else 0
-        count_mnet_ge_0_4 = int(np.sum(probabilities >= 0.4)) if probabilities.size > 0 else 0
-        count_mnet_ge_0_5 = int(np.sum(probabilities >= 0.5)) if probabilities.size > 0 else 0
+        avg_mnet_all = float(np.mean(display_scores)) if display_scores.size > 0 else 0.0
+        positive_display_scores = display_scores[display_scores >= threshold] if display_scores.size > 0 else np.zeros((0,), dtype=np.float32)
+        avg_mnet_pos = float(np.mean(positive_display_scores)) if positive_display_scores.size > 0 else 0.0
+        median_mnet = float(np.median(display_scores)) if display_scores.size > 0 else 0.0
+        std_mnet = float(np.std(display_scores)) if display_scores.size > 0 else 0.0
+        max_mnet = float(np.max(display_scores)) if display_scores.size > 0 else 0.0
+        p95_mnet = float(np.percentile(display_scores, 95)) if display_scores.size > 0 else 0.0
+        count_mnet_ge_0_1 = int(np.sum(display_scores >= 0.1)) if display_scores.size > 0 else 0
+        count_mnet_ge_0_2 = int(np.sum(display_scores >= 0.2)) if display_scores.size > 0 else 0
+        count_mnet_ge_0_3 = int(np.sum(display_scores >= 0.3)) if display_scores.size > 0 else 0
+        count_mnet_ge_0_4 = int(np.sum(display_scores >= 0.4)) if display_scores.size > 0 else 0
+        count_mnet_ge_0_5 = int(np.sum(display_scores >= 0.5)) if display_scores.size > 0 else 0
 
         group = f"{sample.smear_type}_{sample.label_name.lower()}"
 
         overlay_path = None
         if overlay_dir is not None and sample.smear_type == "thick":
             overlay_dir.mkdir(parents=True, exist_ok=True)
-            # render a simple overlay similar to roi_grabber.draw_overlay
-            from .roi_grabber import draw_overlay
-
-            kept_positive_indices = kept_positive_set
-            overlay = draw_overlay(img, proposals, probabilities, kept_positive_indices, threshold)
             stem = Path(sample.source_id).stem
             overlay_path = overlay_dir / f"{stem}_overlay.png"
             try:
@@ -617,13 +599,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi-size", type=int, default=128)
     parser.add_argument("--model-input-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--nms-iou", type=float, default=0.5)
+    parser.add_argument("--nms-iou", "--nms-iou-threshold", dest="nms_iou", type=float, default=0.5)
     parser.add_argument("--min-blob-area", type=float, default=80.0)
     parser.add_argument("--max-blob-area", type=float, default=50000.0)
     parser.add_argument("--limit", type=int, default=0, help="Max images to process (0=all)")
     parser.add_argument("--write-csv", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--overlay-thick", action="store_true", help="Save overlays for thick smears")
+    parser.add_argument("--use-yolo", action="store_true", help="Use YOLOv8 proposals instead of sensing variants")
+    parser.add_argument("--yolo-weights", type=str, default="yolov8n.pt", help="YOLO weights path")
+    parser.add_argument("--yolo-conf", type=float, default=0.3, help="YOLO detection confidence threshold")
+    parser.add_argument("--yolo-nms-iou", type=float, default=0.5, help="YOLO NMS IoU threshold for proposals")
+    parser.add_argument("--roboflow-api-key", type=str, default=None, help="Roboflow API key to download a trained model")
+    parser.add_argument("--roboflow-workspace", type=str, default=None, help="Roboflow workspace name")
+    parser.add_argument("--roboflow-project", type=str, default=None, help="Roboflow project name")
+    parser.add_argument("--roboflow-version", type=int, default=1, help="Roboflow project version to download")
+    parser.add_argument("--roboflow-download-dir", type=str, default=None, help="Local directory to download Roboflow export")
+    parser.add_argument("--use-sahi-pipeline", action="store_true", help="Use tiled sensing pipeline")
+    parser.add_argument("--sahi-tile-size", type=int, default=640, help="SAHI tile size in pixels")
+    parser.add_argument("--sahi-overlap", type=float, default=0.2, help="SAHI tile overlap ratio")
+    parser.add_argument("--sahi-nms-threshold", type=float, default=0.5, help="SAHI NMS IoU threshold")
+    parser.add_argument(
+        "--min-display-score",
+        type=float,
+        default=0.5,
+        help="Minimum MobileNetV3 score to count/display (0.0-1.0)",
+    )
     return parser.parse_args()
 
 
@@ -636,6 +637,22 @@ def main() -> None:
         args.model_path,
         fallback_input_size=(args.model_input_size, args.model_input_size),
     )
+
+    if args.use_yolo and args.roboflow_api_key:
+        try:
+            from .roi_grabber_yolo import download_roboflow_weights
+
+            yolo_path = download_roboflow_weights(
+                api_key=args.roboflow_api_key,
+                workspace=args.roboflow_workspace,
+                project=args.roboflow_project,
+                version=args.roboflow_version,
+                target_dir=args.roboflow_download_dir,
+            )
+            logging.info("Downloaded Roboflow YOLO weights: %s", yolo_path)
+            args.yolo_weights = yolo_path
+        except Exception as exc:
+            logging.warning("Roboflow download failed: %s", exc)
 
     if args.dataset_root is not None and args.dataset_root.exists() and not args.use_zip:
         samples = crawl_dataverse_structure(args.dataset_root, thick_min_dim=512)
@@ -690,6 +707,15 @@ def main() -> None:
             overlay_dir=overlay_dir,
             limit=args.limit,
             progress_total=min(args.limit, len(samples)) if args.limit else len(samples),
+            use_yolo=args.use_yolo,
+            yolo_weights=args.yolo_weights,
+            yolo_conf=args.yolo_conf,
+            yolo_nms_iou=args.yolo_nms_iou,
+            use_sahi_pipeline=args.use_sahi_pipeline,
+            sahi_tile_size=args.sahi_tile_size,
+            sahi_overlap=args.sahi_overlap,
+            sahi_nms_threshold=args.sahi_nms_threshold,
+            min_display_score=args.min_display_score,
         )
 
         args.output_dir.mkdir(parents=True, exist_ok=True)

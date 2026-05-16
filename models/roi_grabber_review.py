@@ -532,8 +532,12 @@ def draw_variant_overlay(
     display_threshold: float | None = None,
 ) -> np.ndarray:
     overlay = image_bgr.copy()
+    visible_indices = set(kept_indices)
 
     for idx, variant_proposal in enumerate(proposals):
+        if idx not in visible_indices:
+            continue
+
         x1, y1, x2, y2 = variant_proposal.proposal.box
         proposal_score = None
         if proposal_scores is not None and proposal_scores.size > idx:
@@ -668,7 +672,8 @@ def compute_overlay_sahi_pipeline(
     batch_size: int,
     max_roi_analysis_lines: int,
     min_display_score: float = 0.0,
-) -> tuple[np.ndarray, int, int, float, list[str], list[str]]:
+    return_details: bool = False,
+) -> tuple[np.ndarray, int, int, float, list[str], list[str]] | tuple[np.ndarray, int, int, float, list[str], list[str], dict[str, np.ndarray | int | float]]:
     """Compute overlay using a tiled variant of the existing sensing pipeline.
 
     SAHI is most useful here as a proposal-expansion layer: tile the image, run the
@@ -749,7 +754,27 @@ def compute_overlay_sahi_pipeline(
                 proposal_quality_scores.append(float(proposal.proposal.area) * center_bias)
 
     if not all_variant_proposals:
-        return image.copy(), 0, 0, 0.0, build_variant_legend(variants, raw_counts, Counter(), Counter(), model is not None), []
+        base_result = (
+            image.copy(),
+            0,
+            0,
+            0.0,
+            build_variant_legend(variants, raw_counts, Counter(), Counter(), model is not None),
+            [],
+        )
+        if not return_details:
+            return base_result
+        empty_f32 = np.zeros((0,), dtype=np.float32)
+        return (
+            *base_result,
+            {
+                "raw_proposal_count": 0,
+                "all_scores": empty_f32,
+                "display_scores": empty_f32,
+                "display_areas": empty_f32,
+                "selection_threshold": float(threshold),
+            },
+        )
 
     # Post-processing across tile boundaries before classification keeps the model
     # from seeing duplicate crops multiple times.
@@ -827,7 +852,25 @@ def compute_overlay_sahi_pipeline(
         threshold=threshold,
         max_lines=max_roi_analysis_lines,
     )
-    return overlay, total_cells, parasites, parasitemia, legend_lines, analysis_lines
+    base_result = (overlay, total_cells, parasites, parasitemia, legend_lines, analysis_lines)
+    if not return_details:
+        return base_result
+
+    all_scores = probabilities.astype(np.float32) if probabilities is not None else np.zeros((0,), dtype=np.float32)
+    sorted_display = sorted(display_indices)
+    if probabilities is not None and sorted_display:
+        display_scores = np.array([float(probabilities[idx]) for idx in sorted_display], dtype=np.float32)
+    else:
+        display_scores = np.zeros((0,), dtype=np.float32)
+    display_areas = np.array([float(kept_variant_proposals[idx].proposal.area) for idx in sorted_display], dtype=np.float32)
+    details: dict[str, np.ndarray | int | float] = {
+        "raw_proposal_count": int(len(all_variant_proposals)),
+        "all_scores": all_scores,
+        "display_scores": display_scores,
+        "display_areas": display_areas,
+        "selection_threshold": float(selection_threshold),
+    }
+    return (*base_result, details)
 
 
 def compute_overlay(
@@ -851,7 +894,8 @@ def compute_overlay(
     sahi_overlap: float = 0.2,
     sahi_nms_threshold: float = 0.5,
     min_display_score: float = 0.0,
-) -> tuple[np.ndarray, int, int, float, list[str], list[str]]:
+    return_details: bool = False,
+) -> tuple[np.ndarray, int, int, float, list[str], list[str]] | tuple[np.ndarray, int, int, float, list[str], list[str], dict[str, np.ndarray | int | float]]:
     # Use SAHI pipeline if requested
     if use_sahi:
         return compute_overlay_sahi_pipeline(
@@ -869,6 +913,7 @@ def compute_overlay(
             batch_size=batch_size,
             max_roi_analysis_lines=max_roi_analysis_lines,
             min_display_score=min_display_score,
+            return_details=return_details,
         )
     variant_proposals: list[VariantProposal] = []
     raw_counts: Counter[str] = Counter()
@@ -955,13 +1000,26 @@ def compute_overlay(
             variant_proposals.extend(proposals)
 
     if not variant_proposals:
-        return (
+        base_result = (
             image.copy(),
             0,
             0,
             0.0,
             build_variant_legend(variants, raw_counts, Counter(), Counter(), model is not None),
             [],
+        )
+        if not return_details:
+            return base_result
+        empty_f32 = np.zeros((0,), dtype=np.float32)
+        return (
+            *base_result,
+            {
+                "raw_proposal_count": 0,
+                "all_scores": empty_f32,
+                "display_scores": empty_f32,
+                "display_areas": empty_f32,
+                "selection_threshold": float(threshold),
+            },
         )
 
     boxes = np.array([proposal.proposal.box for proposal in variant_proposals], dtype=np.float32)
@@ -1037,7 +1095,25 @@ def compute_overlay(
         threshold=threshold,
         max_lines=max_roi_analysis_lines,
     )
-    return overlay, total_cells, parasites, parasitemia, legend_lines, analysis_lines
+    base_result = (overlay, total_cells, parasites, parasitemia, legend_lines, analysis_lines)
+    if not return_details:
+        return base_result
+
+    all_scores = probabilities.astype(np.float32) if probabilities is not None else np.zeros((0,), dtype=np.float32)
+    sorted_display = sorted(display_indices)
+    if probabilities is not None and sorted_display:
+        display_scores = np.array([float(probabilities[idx]) for idx in sorted_display], dtype=np.float32)
+    else:
+        display_scores = np.zeros((0,), dtype=np.float32)
+    display_areas = np.array([float(variant_proposals[idx].proposal.area) for idx in sorted_display], dtype=np.float32)
+    details: dict[str, np.ndarray | int | float] = {
+        "raw_proposal_count": int(len(variant_proposals)),
+        "all_scores": all_scores,
+        "display_scores": display_scores,
+        "display_areas": display_areas,
+        "selection_threshold": float(selection_threshold),
+    }
+    return (*base_result, details)
 
 
 def annotate_hud(
