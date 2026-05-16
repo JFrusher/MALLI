@@ -586,6 +586,58 @@ def non_max_suppression(
     return keep
 
 
+def density_aware_positive_selection(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+    nms_iou_threshold: float,
+    image_shape: tuple[int, int] | None = None,
+    source_count: int | None = None,
+) -> tuple[set[int], float, float, float]:
+    """Select positives with adaptive score and NMS thresholds for dense frames.
+
+    Background hallucinations tend to produce very large proposal counts with low,
+    noisy scores. In those frames we tighten the score floor and NMS threshold
+    together so the display/counting path favors compact, high-confidence clusters
+    instead of thousands of overlapping false positives.
+    """
+
+    if scores.size == 0 or boxes.size == 0:
+        return set(), float(threshold), float(nms_iou_threshold), 0.0
+
+    adaptive_threshold = float(threshold)
+    adaptive_nms_iou = float(nms_iou_threshold)
+
+    proposal_count = int(source_count if source_count is not None else scores.size)
+    proposal_density = float(proposal_count)
+    if image_shape is not None:
+        height, width = image_shape[:2]
+        image_area_mp = max(1e-6, float(height * width) / 1_000_000.0)
+        proposal_density = proposal_count / image_area_mp
+
+    if proposal_count >= 400 or proposal_density >= 450.0:
+        adaptive_threshold = max(adaptive_threshold, 0.68, float(np.percentile(scores, 90)))
+        adaptive_nms_iou = min(adaptive_nms_iou, 0.10)
+    elif proposal_count >= 220 or proposal_density >= 240.0:
+        adaptive_threshold = max(adaptive_threshold, 0.60, float(np.percentile(scores, 80)))
+        adaptive_nms_iou = min(adaptive_nms_iou, 0.14)
+    elif proposal_count >= 120 or proposal_density >= 140.0:
+        adaptive_threshold = max(adaptive_threshold, 0.52, float(np.percentile(scores, 70)))
+        adaptive_nms_iou = min(adaptive_nms_iou, 0.18)
+
+    positive_indices = np.where(scores >= adaptive_threshold)[0]
+    if positive_indices.size == 0:
+        return set(), adaptive_threshold, adaptive_nms_iou, proposal_density
+
+    kept_relative = non_max_suppression(
+        boxes[positive_indices],
+        scores[positive_indices],
+        iou_threshold=adaptive_nms_iou,
+    )
+    kept_indices = {int(positive_indices[rel_idx]) for rel_idx in kept_relative}
+    return kept_indices, adaptive_threshold, adaptive_nms_iou, proposal_density
+
+
 def draw_overlay(
     image_bgr: np.ndarray,
     proposals: Sequence[RoiProposal],
@@ -606,12 +658,14 @@ def draw_overlay(
             confidence_value = float(probabilities[idx]) if probabilities.size > idx else threshold
             color = confidence_to_bgr(confidence_value)
             label_text = f"INF {probabilities[idx]:.2f}"
+            text_color = (255, 255, 255)
         elif probabilities[idx] >= threshold:
             continue
         else:
             confidence_value = float(probabilities[idx]) if probabilities.size > idx else 0.0
             color = confidence_to_bgr(confidence_value)
             label_text = f"HLT {probabilities[idx]:.2f}"
+            text_color = (0, 0, 0)
 
         thickness = 1 + int(round(float(probabilities[idx]) * 3.0)) if probabilities.size > idx else 2
         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
@@ -621,7 +675,7 @@ def draw_overlay(
             (x1, max(15, y1 - 5)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
-            color,
+            text_color,
             1,
             cv2.LINE_AA,
         )
@@ -719,13 +773,22 @@ def process_single_image(
         batch_size=batch_size,
     )
 
-    positive_indices = np.where(probabilities >= threshold)[0]
-    kept_positive_set: set[int] = set()
-    if positive_indices.size > 0:
-        positive_boxes = np.array([proposals[idx].box for idx in positive_indices], dtype=np.float32)
-        positive_scores = probabilities[positive_indices]
-        kept_positive_rel = non_max_suppression(positive_boxes, positive_scores, iou_threshold=nms_iou_threshold)
-        kept_positive_set = {int(positive_indices[rel_idx]) for rel_idx in kept_positive_rel}
+    proposal_boxes = np.array([proposal.box for proposal in proposals], dtype=np.float32)
+    kept_positive_set, adaptive_threshold, adaptive_nms_iou, proposal_density = density_aware_positive_selection(
+        boxes=proposal_boxes,
+        scores=probabilities,
+        threshold=threshold,
+        nms_iou_threshold=nms_iou_threshold,
+        image_shape=image.shape,
+        source_count=len(proposals),
+    )
+    if adaptive_threshold > threshold:
+        logging.debug(
+            "Adaptive suppression enabled | density=%.1f proposals/MP | score_floor=%.3f | nms_iou=%.3f",
+            proposal_density,
+            adaptive_threshold,
+            adaptive_nms_iou,
+        )
 
     total_cells = len(proposals)
     parasites = len(kept_positive_set)
@@ -738,7 +801,7 @@ def process_single_image(
             proposals=proposals,
             probabilities=probabilities,
             kept_positive_indices=kept_positive_set,
-            threshold=threshold,
+            threshold=adaptive_threshold,
         )
         overlay_stem = Path(sample.source_id).stem
         overlay_path = overlay_dir / f"{overlay_stem}_overlay.png"

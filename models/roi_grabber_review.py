@@ -36,6 +36,7 @@ from .detection_pipeline import (
 from .roi_grabber import (
     SUPPORTED_EXTENSIONS,
     batch_predict_rois,
+    density_aware_positive_selection,
     extract_roi_proposals,
     RoiProposal,
     infer_label_from_parts,
@@ -557,6 +558,11 @@ def draw_variant_overlay(
             confidence_value = proposal_score
 
         color = confidence_to_bgr(confidence_value)
+        text_color = (
+            (255, 255, 255)
+            if classifier_score is not None and classifier_score >= (display_threshold if display_threshold is not None else 0.3)
+            else (0, 0, 0)
+        )
         if idx in positive_indices:
             thickness = 2 + int(round(confidence_value * 3))
         elif idx in kept_indices:
@@ -575,7 +581,7 @@ def draw_variant_overlay(
             (x1 + 3, max(14, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
-            (255, 255, 255),
+            text_color,
             1,
             cv2.LINE_AA,
         )
@@ -661,6 +667,7 @@ def compute_overlay_sahi_pipeline(
     model_input_size: tuple[int, int],
     batch_size: int,
     max_roi_analysis_lines: int,
+    min_display_score: float = 0.0,
 ) -> tuple[np.ndarray, int, int, float, list[str], list[str]]:
     """Compute overlay using a tiled variant of the existing sensing pipeline.
 
@@ -763,31 +770,53 @@ def compute_overlay_sahi_pipeline(
         )
 
     kept_indices = set(range(len(kept_variant_proposals)))
-    positive_indices: set[int] = set()
+    display_indices = kept_indices
+    selection_threshold = threshold
     if probabilities is not None:
-        positive_indices = {idx for idx in kept_indices if float(probabilities[idx]) >= threshold}
+        proposal_boxes = np.array([proposal.proposal.box for proposal in kept_variant_proposals], dtype=np.float32)
+        positive_indices, selection_threshold, selection_nms_iou, proposal_density = density_aware_positive_selection(
+            boxes=proposal_boxes,
+            scores=probabilities,
+            threshold=threshold,
+            nms_iou_threshold=nms_threshold,
+            image_shape=image.shape,
+            source_count=len(all_variant_proposals),
+        )
+        if selection_threshold > threshold:
+            logging.debug(
+                "Adaptive suppression enabled | density=%.1f proposals/MP | score_floor=%.3f | nms_iou=%.3f",
+                proposal_density,
+                selection_threshold,
+                selection_nms_iou,
+            )
+        display_floor = max(min_display_score, selection_threshold)
+        if display_floor > 0.0:
+            display_indices = {idx for idx in kept_indices if float(probabilities[idx]) >= display_floor}
+    else:
+        positive_indices = set()
 
     kept_counts: Counter[str] = Counter()
     positive_counts: Counter[str] = Counter()
-    for idx in kept_indices:
+    for idx in display_indices:
         variant_name = kept_variant_proposals[idx].variant.name
         kept_counts[variant_name] += 1
     for idx in positive_indices:
-        variant_name = kept_variant_proposals[idx].variant.name
-        positive_counts[variant_name] += 1
+        if idx in display_indices:
+            variant_name = kept_variant_proposals[idx].variant.name
+            positive_counts[variant_name] += 1
 
     overlay = draw_variant_overlay(
         image_bgr=image,
         proposals=kept_variant_proposals,
         classifier_scores=probabilities,
         proposal_scores=None,
-        kept_indices=kept_indices,
+        kept_indices=display_indices,
         positive_indices=positive_indices,
-        display_threshold=threshold,
+        display_threshold=selection_threshold,
     )
 
-    total_cells = len(kept_indices)
-    parasites = len(positive_indices)
+    total_cells = len(display_indices)
+    parasites = len(positive_indices & display_indices)
     parasitemia = (100.0 * parasites / total_cells) if total_cells > 0 else 0.0
     legend_lines = build_variant_legend(variants, raw_counts, kept_counts, positive_counts, model is not None)
     analysis_lines = build_roi_analysis_lines(
@@ -821,6 +850,7 @@ def compute_overlay(
     sahi_tile_size: int = 640,
     sahi_overlap: float = 0.2,
     sahi_nms_threshold: float = 0.5,
+    min_display_score: float = 0.0,
 ) -> tuple[np.ndarray, int, int, float, list[str], list[str]]:
     # Use SAHI pipeline if requested
     if use_sahi:
@@ -838,6 +868,7 @@ def compute_overlay(
             model_input_size=model_input_size,
             batch_size=batch_size,
             max_roi_analysis_lines=max_roi_analysis_lines,
+            min_display_score=min_display_score,
         )
     variant_proposals: list[VariantProposal] = []
     raw_counts: Counter[str] = Counter()
@@ -951,31 +982,51 @@ def compute_overlay(
     kept_indices = set(kept_indices_list)
 
     positive_indices: set[int] = set()
+    display_indices = set(kept_indices_list)
+    selection_threshold = threshold
     if probabilities is not None:
-        positive_indices = {idx for idx in kept_indices_list if float(probabilities[idx]) >= threshold}
+        proposal_boxes = np.array([proposal.proposal.box for proposal in variant_proposals], dtype=np.float32)
+        positive_indices, selection_threshold, selection_nms_iou, proposal_density = density_aware_positive_selection(
+            boxes=proposal_boxes,
+            scores=probabilities,
+            threshold=threshold,
+            nms_iou_threshold=nms_iou_threshold,
+            image_shape=image.shape,
+            source_count=len(variant_proposals),
+        )
+        if selection_threshold > threshold:
+            logging.debug(
+                "Adaptive suppression enabled | density=%.1f proposals/MP | score_floor=%.3f | nms_iou=%.3f",
+                proposal_density,
+                selection_threshold,
+                selection_nms_iou,
+            )
+        display_floor = max(min_display_score, selection_threshold)
+        if display_floor > 0.0:
+            display_indices = {idx for idx in kept_indices_list if float(probabilities[idx]) >= display_floor}
 
     kept_counts: Counter[str] = Counter()
     positive_counts: Counter[str] = Counter()
-    for idx in kept_indices_list:
+    for idx in display_indices:
         variant_name = variant_proposals[idx].variant.name
         kept_counts[variant_name] += 1
     for idx in positive_indices:
-        variant_name = variant_proposals[idx].variant.name
-        positive_counts[variant_name] += 1
+        if idx in display_indices:
+            variant_name = variant_proposals[idx].variant.name
+            positive_counts[variant_name] += 1
 
     overlay = draw_variant_overlay(
         image_bgr=image,
         proposals=variant_proposals,
         classifier_scores=probabilities,
         proposal_scores=proposal_scores,
-        kept_indices=kept_indices,
+        kept_indices=display_indices,
         positive_indices=positive_indices,
-        # Use the classifier threshold for visualizing INF/HLT and coloring
-        display_threshold=threshold,
+        display_threshold=selection_threshold,
     )
 
-    total_cells = len(kept_indices_list)
-    parasites = len(positive_indices)
+    total_cells = len(display_indices)
+    parasites = len(positive_indices & display_indices)
     parasitemia = (100.0 * parasites / total_cells) if total_cells > 0 else 0.0
     legend_lines = build_variant_legend(variants, raw_counts, kept_counts, positive_counts, model is not None)
     analysis_lines = build_roi_analysis_lines(
@@ -1013,10 +1064,39 @@ def annotate_hud(
         header_lines.append("ROI analysis (top MobileNetV3-positive ROIs):")
         header_lines.extend(roi_analysis_lines)
 
+    is_infected = sample.label_name.lower().startswith("infect") or sample.label_name.lower().startswith("paras")
+    badge_text = "I" if is_infected else "U"
+    badge_font = cv2.FONT_HERSHEY_DUPLEX if sample.smear_type == "thick" else cv2.FONT_HERSHEY_SIMPLEX
+    badge_thickness = 3 if sample.smear_type == "thick" else 1
+
+    badge_margin = 14
+    badge_width = 124
+    badge_height = 132
+    badge_x2 = canvas.shape[1] - badge_margin
+    badge_y1 = badge_margin
+    badge_x1 = max(0, badge_x2 - badge_width)
+    badge_y2 = min(canvas.shape[0] - 1, badge_y1 + badge_height)
+
+    cv2.rectangle(canvas, (badge_x1, badge_y1), (badge_x2, badge_y2), (0, 0, 0), -1)
+    cv2.rectangle(canvas, (badge_x1, badge_y1), (badge_x2, badge_y2), (255, 255, 255), 2)
+
+    badge_scale = 2.35
+    badge_size = cv2.getTextSize(badge_text, badge_font, badge_scale, badge_thickness)[0]
+    badge_text_x = badge_x1 + (badge_width - badge_size[0]) // 2
+    badge_text_y = badge_y1 + 56
+    cv2.putText(canvas, badge_text, (badge_text_x, badge_text_y), badge_font, badge_scale, (255, 255, 255), badge_thickness, cv2.LINE_AA)
+
+    parasites_text = f"{int(round(parasitemia))}%"
+    parasites_scale = 0.8
+    parasites_size = cv2.getTextSize(parasites_text, cv2.FONT_HERSHEY_SIMPLEX, parasites_scale, 2)[0]
+    parasites_x = badge_x1 + (badge_width - parasites_size[0]) // 2
+    parasites_y = badge_y1 + 103
+    cv2.putText(canvas, parasites_text, (parasites_x, parasites_y), cv2.FONT_HERSHEY_SIMPLEX, parasites_scale, (255, 255, 255), 2, cv2.LINE_AA)
+
     y = 20
     for line in header_lines:
-        cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 1, cv2.LINE_AA)
         y += 24
     return canvas
 
@@ -1035,7 +1115,12 @@ def parse_args() -> argparse.Namespace:
         help="MobileNetV3 weights or saved model path",
     )
     parser.add_argument("--disable-model", action="store_true", help="Show ROI boxes only, without classifier labels")
-    parser.add_argument("--threshold", type=float, default=0.85, help="Infected threshold")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.4,
+        help="Infected threshold (calibrated default)",
+    )
     parser.add_argument("--roi-size", type=int, default=128, help="Minimum ROI side length for extracted crops")
     parser.add_argument("--model-input-size", type=int, default=224, help="Model input size")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for ROI inference")
@@ -1058,6 +1143,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roboflow-version", type=int, default=1, help="Roboflow project version to download")
     parser.add_argument("--roboflow-download-dir", type=str, default=None, help="Local directory to download Roboflow export")
     parser.add_argument("--max-roi-analysis-lines", type=int, default=10, help="Maximum ROI analysis lines shown in the HUD")
+    parser.add_argument(
+        "--min-display-score",
+        type=float,
+        default=0.5,
+        help="Minimum MobileNetV3 score to display (0.0-1.0); boxes below this are hidden",
+    )
     # SAHI Pipeline arguments (new Dart-compatible pipeline)
     parser.add_argument(
         "--use-sahi-pipeline",
@@ -1420,6 +1511,7 @@ def main() -> None:
                 sahi_tile_size=args.sahi_tile_size,
                 sahi_overlap=args.sahi_overlap,
                 sahi_nms_threshold=args.sahi_nms_threshold,
+                min_display_score=args.min_display_score,
             )
 
             hud = annotate_hud(

@@ -112,6 +112,13 @@ def build_summary_row(items: list[dict], name: str) -> dict[str, float | int | s
     avg_pos_mnets = [float(it["avg_mnet_pos"]) for it in items if float(it["avg_mnet_pos"]) > 0.0]
     avg_props = [float(it["avg_proposal_area"]) for it in items]
     raw_counts = [int(it["raw_proposal_count"]) for it in items]
+    max_scores = [float(it["max_mnet"]) for it in items]
+    p95_scores = [float(it["p95_mnet"]) for it in items]
+    above_01 = [int(it["count_mnet_ge_0_1"]) for it in items]
+    above_02 = [int(it["count_mnet_ge_0_2"]) for it in items]
+    above_03 = [int(it["count_mnet_ge_0_3"]) for it in items]
+    above_04 = [int(it["count_mnet_ge_0_4"]) for it in items]
+    above_05 = [int(it["count_mnet_ge_0_5"]) for it in items]
 
     para_pct = percentile_summary(paras)
     total_pct = percentile_summary([float(v) for v in totals])
@@ -140,6 +147,14 @@ def build_summary_row(items: list[dict], name: str) -> dict[str, float | int | s
         "mean_avg_proposal_area": float(np.mean(avg_props)) if avg_props else 0.0,
         "mean_raw_proposal_count": float(np.mean(raw_counts)) if raw_counts else 0.0,
         "median_raw_proposal_count": raw_pct["median"],
+        "mean_max_mnet": float(np.mean(max_scores)) if max_scores else 0.0,
+        "median_max_mnet": float(np.median(max_scores)) if max_scores else 0.0,
+        "mean_p95_mnet": float(np.mean(p95_scores)) if p95_scores else 0.0,
+        "mean_count_mnet_ge_0_1": float(np.mean(above_01)) if above_01 else 0.0,
+        "mean_count_mnet_ge_0_2": float(np.mean(above_02)) if above_02 else 0.0,
+        "mean_count_mnet_ge_0_3": float(np.mean(above_03)) if above_03 else 0.0,
+        "mean_count_mnet_ge_0_4": float(np.mean(above_04)) if above_04 else 0.0,
+        "mean_count_mnet_ge_0_5": float(np.mean(above_05)) if above_05 else 0.0,
         "pct_zero_cells": 100.0 * zero_cells / len(items) if items else 0.0,
         "pct_zero_parasitemia": 100.0 * zero_parasitemia / len(items) if items else 0.0,
         "pct_any_parasites": 100.0 * any_parasites / len(items) if items else 0.0,
@@ -279,6 +294,13 @@ def process_all(
         avg_mnet_pos = float(np.mean(probabilities[positive_indices])) if positive_indices.size > 0 else 0.0
         median_mnet = float(np.median(probabilities)) if probabilities.size > 0 else 0.0
         std_mnet = float(np.std(probabilities)) if probabilities.size > 0 else 0.0
+        max_mnet = float(np.max(probabilities)) if probabilities.size > 0 else 0.0
+        p95_mnet = float(np.percentile(probabilities, 95)) if probabilities.size > 0 else 0.0
+        count_mnet_ge_0_1 = int(np.sum(probabilities >= 0.1)) if probabilities.size > 0 else 0
+        count_mnet_ge_0_2 = int(np.sum(probabilities >= 0.2)) if probabilities.size > 0 else 0
+        count_mnet_ge_0_3 = int(np.sum(probabilities >= 0.3)) if probabilities.size > 0 else 0
+        count_mnet_ge_0_4 = int(np.sum(probabilities >= 0.4)) if probabilities.size > 0 else 0
+        count_mnet_ge_0_5 = int(np.sum(probabilities >= 0.5)) if probabilities.size > 0 else 0
 
         group = f"{sample.smear_type}_{sample.label_name.lower()}"
 
@@ -314,6 +336,13 @@ def process_all(
                 "avg_mnet_pos": float(avg_mnet_pos),
                 "median_mnet": float(median_mnet),
                 "std_mnet": float(std_mnet),
+                "max_mnet": float(max_mnet),
+                "p95_mnet": float(p95_mnet),
+                "count_mnet_ge_0_1": int(count_mnet_ge_0_1),
+                "count_mnet_ge_0_2": int(count_mnet_ge_0_2),
+                "count_mnet_ge_0_3": int(count_mnet_ge_0_3),
+                "count_mnet_ge_0_4": int(count_mnet_ge_0_4),
+                "count_mnet_ge_0_5": int(count_mnet_ge_0_5),
                 "overlay_path": str(overlay_path) if overlay_path is not None else "",
             }
         )
@@ -415,6 +444,24 @@ def summarize_and_plot(rows: list[dict], out_dir: Path) -> None:
     plt.close()
 
     plt.figure(figsize=(10, 6))
+    plt.boxplot([[r["max_mnet"] for r in groups[g]] for g in group_names], labels=group_names, showmeans=True)
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("max_mnet")
+    plt.title("Maximum MobileNetV3 score per image by group")
+    plt.tight_layout()
+    plt.savefig(out_dir / "max_mnet_by_group_box.png")
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    plt.boxplot([[r["p95_mnet"] for r in groups[g]] for g in group_names], labels=group_names, showmeans=True)
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("p95_mnet")
+    plt.title("95th percentile MobileNetV3 score per image by group")
+    plt.tight_layout()
+    plt.savefig(out_dir / "p95_mnet_by_group_box.png")
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
     cmap = plt.get_cmap("tab10")
     for i, g in enumerate(group_names):
         grp_items = groups[g]
@@ -427,6 +474,20 @@ def summarize_and_plot(rows: list[dict], out_dir: Path) -> None:
     plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(out_dir / "parasitemia_vs_avg_mnet_scatter.png")
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    for i, g in enumerate(group_names):
+        grp_items = groups[g]
+        x = [it["max_mnet"] for it in grp_items]
+        y = [it["parasitemia"] for it in grp_items]
+        plt.scatter(x, y, color=cmap(i % 10), label=g, alpha=0.75, s=36)
+    plt.xlabel("max_mnet")
+    plt.ylabel("parasitemia")
+    plt.title("Parasitemia vs max MobileNetV3 score (per image)")
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_dir / "parasitemia_vs_max_mnet_scatter.png")
     plt.close()
 
     plt.figure(figsize=(10, 6))
@@ -467,6 +528,10 @@ def summarize_and_plot(rows: list[dict], out_dir: Path) -> None:
     uninfected_paras = [float(r["parasitemia"]) for r in uninfected]
     thick_paras = [float(r["parasitemia"]) for r in thick]
     thin_paras = [float(r["parasitemia"]) for r in thin]
+    infected_max = [float(r["max_mnet"]) for r in infected]
+    uninfected_max = [float(r["max_mnet"]) for r in uninfected]
+    infected_p95 = [float(r["p95_mnet"]) for r in infected]
+    uninfected_p95 = [float(r["p95_mnet"]) for r in uninfected]
 
     txt = out_dir / "diagnostic_summary.txt"
     with txt.open("w", encoding="utf-8") as fh:
@@ -478,6 +543,18 @@ def summarize_and_plot(rows: list[dict], out_dir: Path) -> None:
                 f"- Infected vs Uninfected parasitemia: mean {np.mean(infected_paras):.3f}% vs {np.mean(uninfected_paras):.3f}% | "
                 f"median {np.median(infected_paras):.3f}% vs {np.median(uninfected_paras):.3f}% | "
                 f"Cohen's d={cohen_d(infected_paras, uninfected_paras):.3f}\n"
+            )
+        if infected_max and uninfected_max:
+            fh.write(
+                f"- Infected vs Uninfected max score: mean {np.mean(infected_max):.3f} vs {np.mean(uninfected_max):.3f} | "
+                f"median {np.median(infected_max):.3f} vs {np.median(uninfected_max):.3f} | "
+                f"Cohen's d={cohen_d(infected_max, uninfected_max):.3f}\n"
+            )
+        if infected_p95 and uninfected_p95:
+            fh.write(
+                f"- Infected vs Uninfected p95 score: mean {np.mean(infected_p95):.3f} vs {np.mean(uninfected_p95):.3f} | "
+                f"median {np.median(infected_p95):.3f} vs {np.median(uninfected_p95):.3f} | "
+                f"Cohen's d={cohen_d(infected_p95, uninfected_p95):.3f}\n"
             )
         if thick_paras and thin_paras:
             fh.write(
@@ -496,7 +573,15 @@ def summarize_and_plot(rows: list[dict], out_dir: Path) -> None:
                 notes.append("weak classifier confidence")
             if float(r["pct_any_parasites"]) < 20.0 and r["group"].endswith("infected"):
                 notes.append("infected group rarely crosses threshold")
+            if float(r["mean_max_mnet"]) < 0.4:
+                notes.append("max score stays below common threshold")
             fh.write(f"- {r['group']}: mean parasitemia={r['mean_parasitemia']:.3f}%, median={r['median_parasitemia']:.3f}%, mean cells={r['mean_total_cells']:.2f}, mean mnet={r['mean_avg_mnet']:.3f}, notes={'; '.join(notes) if notes else 'ok'}\n")
+        fh.write("\nThreshold sweep sanity check:\n")
+        for threshold in [0.1, 0.2, 0.3, 0.4, 0.5]:
+            key = f"mean_count_mnet_ge_{str(threshold).replace('.', '_')}"
+            fh.write(f"- mean proposals >= {threshold:.1f}: {overall_stats.get(key, 0.0):.2f}\n")
+        if infected_max and uninfected_max and np.mean(infected_max) < np.mean(uninfected_max):
+            fh.write("- Warning: infected images have lower max scores than uninfected images, which suggests the positive class may be undercalibrated or inverted.\n")
         fh.write("\nSmear-type breakdown:\n")
         for r in smear_stats:
             fh.write(f"- {r['group']}: {r}\n")
@@ -512,6 +597,8 @@ def summarize_and_plot(rows: list[dict], out_dir: Path) -> None:
         "smears": smear_stats,
         "effect_sizes": {
             "infected_vs_uninfected_parasitemia_d": cohen_d(infected_paras, uninfected_paras),
+            "infected_vs_uninfected_max_mnet_d": cohen_d(infected_max, uninfected_max),
+            "infected_vs_uninfected_p95_mnet_d": cohen_d(infected_p95, uninfected_p95),
             "thick_vs_thin_parasitemia_d": cohen_d(thick_paras, thin_paras),
         },
     }
