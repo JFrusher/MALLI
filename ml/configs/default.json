@@ -1,0 +1,30 @@
+{
+  "_comment": "M.A.L.L.I. Training Configuration - Example for production runs",
+  "data": {
+    "dataset_root": "datasets/nih",
+    "zip_path": "shared/data/dataverse_files.zip",
+    "cache_dir": "datasets/blood_smear/processed/tfrecord",
+    "use_tfrecord_cache": true,
+    "tfrecord_shards": 16,
+    "rebuild_cache": false,
+    "image_size": [224, 224],
+    "test_split": 0.2,
+    "batch_size": 32,
+    "seed": 42,
+    "synthetic_dataset_root": "datasets/synthetic_field_ready",
+    "synthetic_labels_csv": "labels.csv"
+  },
+  "model": {
+    "dropout_rate": 0.3,
+    "train_backbone": false
+  },
+  "train": {
+    "epochs": 50,
+    "learning_rate": 1e-3,
+    "early_stopping_patience": 8
+  },
+  "export": {
+    "enabled": true,
+    "representative_batches": 150
+  }
+}

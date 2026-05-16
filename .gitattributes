@@ -1,0 +1,141 @@
+# .gitattributes - Ensure consistent line endings across platforms
+# Handles line ending differences between Windows, macOS, and Linux
+
+# ============================================================================
+# AUTO DETECT SETTINGS
+# ============================================================================
+* text=auto
+
+# ============================================================================
+# TEXT FILES - Unix line endings (LF)
+# ============================================================================
+
+# Source code
+*.py text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.jsx text eol=lf
+*.tsx text eol=lf
+*.dart text eol=lf
+*.java text eol=lf
+*.kt text eol=lf
+*.swift text eol=lf
+*.m text eol=lf
+*.mm text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+
+# Configuration files
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.conf text eol=lf
+*.properties text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+*.bash text eol=lf
+*.zsh text eol=lf
+*.fish text eol=lf
+Makefile text eol=lf
+
+# Documentation
+*.md text eol=lf
+*.markdown text eol=lf
+*.rst text eol=lf
+*.txt text eol=lf
+*.adoc text eol=lf
+
+# Git & version control
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Docker
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
+.dockerignore text eol=lf
+
+# CI/CD
+*.yml text eol=lf
+*.yaml text eol=lf
+.github/** text eol=lf
+
+# Package managers
+requirements.txt text eol=lf
+setup.py text eol=lf
+setup.cfg text eol=lf
+pyproject.toml text eol=lf
+pubspec.yaml text eol=lf
+pubspec.lock text eol=lf
+package.json text eol=lf
+package-lock.json text eol=lf
+Gemfile text eol=lf
+Gemfile.lock text eol=lf
+
+# ============================================================================
+# BINARY FILES
+# ============================================================================
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mov binary
+*.mp4 binary
+*.mp3 binary
+*.gz binary
+*.zip binary
+*.7z binary
+*.ttf binary
+*.otf binary
+*.exe binary
+
+# Models and weights
+*.h5 binary
+*.keras binary
+*.pt binary
+*.pth binary
+*.pb binary
+*.onnx binary
+*.tflite binary
+*.mlmodel binary
+*.weights binary
+*.pkl binary
+*.pickle binary
+*.joblib binary
+
+# Archives
+*.tar binary
+*.tar.gz binary
+*.tar.bz2 binary
+*.rar binary
+*.iso binary
+
+# Documents
+*.pdf binary
+*.doc binary
+*.docx binary
+*.xls binary
+*.xlsx binary
+*.ppt binary
+*.pptx binary
+
+# Binaries
+*.dll binary
+*.so binary
+*.dylib binary
+*.o binary
+
+# ============================================================================
+# GIT-SPECIFIC SETTINGS
+# ============================================================================
+
+# Treat these files as merged
+.gitkeep merge=union
