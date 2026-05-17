@@ -424,6 +424,26 @@ def load_config(config_path: str | None, args: argparse.Namespace) -> Dict[str, 
     config["export"]["representative_batches"] = args.representative_batches
     config["dashboard"]["launch_tensorboard"] = args.dashboard
     config["dashboard"]["port"] = args.dashboard_port
+
+    # Apply stage selection from CLI (1-based indices)
+    if args.stages is not None:
+        selected = []
+        for n in args.stages:
+            if not (1 <= n <= len(config["stages"])):
+                raise ValueError(f"Requested stage {n} is out of range (1-{len(config['stages'])})")
+            selected.append(config["stages"][n - 1])
+        config["stages"] = selected
+
+    # Override epochs per-stage if requested. Accept single value or list matching stages.
+    if args.epochs is not None:
+        if len(args.epochs) == 1:
+            for s in config["stages"]:
+                s["epochs"] = args.epochs[0]
+        elif len(args.epochs) == len(config["stages"]):
+            for s, e in zip(config["stages"], args.epochs):
+                s["epochs"] = e
+        else:
+            raise ValueError("When specifying --epochs with multiple values, the count must match the selected stages")
     
     return config
 
@@ -495,22 +515,31 @@ def build_dataset_registry(config: Dict[str, Any]) -> Dict[str, tuple[tf.data.Da
     nih_train_ds, nih_val_ds = nih_dataset.create_datasets()
     logger.info("✓ NIH dataset loaded")
 
-    synthetic_dataset = SyntheticFieldReadyDataset(
-        dataset_root=config["data"]["synthetic_dataset_root"],
-        labels_csv=config["data"]["synthetic_labels_csv"],
-        image_size=tuple(config["data"]["image_size"]),
-        batch_size=config["data"]["batch_size"],
-        test_split=config["data"]["test_split"],
-        seed=config["data"]["seed"],
-        augment_training=True,
-    )
-    synthetic_train_ds, synthetic_val_ds = synthetic_dataset.create_datasets()
-    logger.info("✓ Synthetic dataset loaded")
-
-    return {
+    datasets: dict[str, tuple[tf.data.Dataset, tf.data.Dataset]] = {
         "nih": (nih_train_ds, nih_val_ds),
-        "synthetic": (synthetic_train_ds, synthetic_val_ds),
     }
+
+    # Load synthetic dataset only if present and required by selected stages
+    synthetic_root = Path(config["data"].get("synthetic_dataset_root", ""))
+    labels_csv_file = config["data"].get("synthetic_labels_csv", "labels.csv")
+    labels_csv_path = synthetic_root / labels_csv_file
+    if synthetic_root.exists() and labels_csv_path.exists():
+        synthetic_dataset = SyntheticFieldReadyDataset(
+            dataset_root=str(synthetic_root),
+            labels_csv=labels_csv_file,  # Pass filename only; loader will concatenate with dataset_root
+            image_size=tuple(config["data"]["image_size"]),
+            batch_size=config["data"]["batch_size"],
+            test_split=config["data"]["test_split"],
+            seed=config["data"]["seed"],
+            augment_training=True,
+        )
+        synthetic_train_ds, synthetic_val_ds = synthetic_dataset.create_datasets()
+        datasets["synthetic"] = (synthetic_train_ds, synthetic_val_ds)
+        logger.info("✓ Synthetic dataset loaded")
+    else:
+        logger.warning("Synthetic dataset not found or labels CSV missing: %s", labels_csv_path)
+
+    return datasets
 
 
 def run_training_stage(
@@ -705,6 +734,13 @@ def main() -> None:
 
     # Execute training stages
     for i, stage in enumerate(config["stages"], 1):
+        if stage["dataset"] not in datasets:
+            logger.error(
+                "Stage %s requires dataset '%s' which is not available. Check dataset paths and --stages selection.",
+                stage.get("name", i),
+                stage["dataset"],
+            )
+            sys.exit(1)
         stage_dataset = datasets[stage["dataset"]]
         stage_train_ds, stage_val_ds = stage_dataset
         

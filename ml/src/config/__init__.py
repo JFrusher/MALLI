@@ -1,1 +1,1 @@
-﻿Configuration utilities.
+﻿"""Configuration utilities."""

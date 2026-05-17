@@ -1,1 +1,1 @@
-﻿ROI detection and proposal generation.
+﻿"""ROI detection and proposal generation."""

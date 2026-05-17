@@ -1,1 +1,1 @@
-﻿Model implementations and training utilities.
+﻿"""Model implementations and training utilities."""
