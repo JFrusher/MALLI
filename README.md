@@ -16,60 +16,60 @@ This repository represents **enterprise-grade software engineering** across full
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    CLINICAL DEPLOYMENT                          │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │        Mobile Application (Flutter/Dart)                │  │
-│  │  ┌─────────────────────────────────────────────────────┐│  │
-│  │  │ • Real-time camera capture & preprocessing          ││  │
-│  │  │ • On-device inference (TFLite INT8 quantized)      ││  │
-│  │  │ • ROI detection & cell counting                     ││  │
-│  │  │ • Local SQLite result logging                       ││  │
-│  │  │ • Cross-platform: iOS (CoreML), Android (TFLite)   ││  │
-│  │  └─────────────────────────────────────────────────────┘│  │
-│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │        Mobile Application (Flutter/Dart)                 │   │
+│  │  ┌─────────────────────────────────────────────────────┐ │   │
+│  │  │ • Real-time camera capture & preprocessing          │ │   │
+│  │  │ • On-device inference (TFLite INT8 quantized)       │ │   │
+│  │  │ • ROI detection & cell counting                     │ │   │
+│  │  │ • Local SQLite result logging                       │ │   │
+│  │  │ • Cross-platform: iOS (CoreML), Android (TFLite)    │ │   │
+│  │  └─────────────────────────────────────────────────────┘ │   │
+│  └──────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
                               ▲
                               │ Model Assets
                               │ (platform-specific)
 ┌──────────────────────────────────────────────────────────────────┐
 │              ML PIPELINE & EXPORT INFRASTRUCTURE                 │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │     Training Pipeline (Python/TensorFlow/Keras)         │  │
-│  │                                                          │  │
-│  │  Stage 1: NIH Warmup        ─┐                          │  │
-│  │           (pretrain base)     ├─► Multi-Format Export  │  │
-│  │  Stage 2: NIH Refinement    ─┤   ├─ TFLite INT8        │  │
-│  │  Stage 3: Synthetic Warmup ─┤   ├─ ONNX (optional)     │  │
-│  │  Stage 4: Synthetic Refine ─┤   ├─ CoreML (optional)   │  │
-│  │  Stage 5: Polish           ─┘   └─ Metadata logging    │  │
-│  │                                                          │  │
-│  │  ┌────────────────────────────────────────────────────┐│  │
-│  │  │ Mobile Asset Sync Pipeline                         ││  │
-│  │  │ • SHA256 verification                              ││  │
-│  │  │ • Platform-specific routing                        ││  │
-│  │  │ • Asset manifest generation                        ││  │
-│  │  │ • Auto-deployment to mobile/assets/{android,ios}  ││  │
-│  │  └────────────────────────────────────────────────────┘│  │
-│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │     Training Pipeline (Python/TensorFlow/Keras)          │    │
+│  │                                                          │    │
+│  │  Stage 1: NIH Warmup       ─┐                            │    │
+│  │           (pretrain base)   ├─► Multi-Format Export      │    │
+│  │  Stage 2: NIH Refinement   ─┤   ├─ TFLite INT8           │    │
+│  │  Stage 3: Synthetic Warmup ─┤   ├─ ONNX (optional)       │    │
+│  │  Stage 4: Synthetic Refine ─┤   ├─ CoreML (optional)     │    │
+│  │  Stage 5: Polish           ─┘   └─ Metadata logging      │    │
+│  │                                                          │    │
+│  │  ┌────────────────────────────────────────────────────┐  │    │
+│  │  │ Mobile Asset Sync Pipeline                         │  │    │
+│  │  │ • SHA256 verification                              │  │    │
+│  │  │ • Platform-specific routing                        │  │    │
+│  │  │ • Asset manifest generation                        │  │    │
+│  │  │ • Auto-deployment to mobile/assets/{android,ios}   │  │    │
+│  │  └────────────────────────────────────────────────────┘  │    │
+│  └──────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────┘
                               ▲
                               │ Training Data
                               │
 ┌──────────────────────────────────────────────────────────────────┐
 │                      DATA INGESTION LAYER                        │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ • NIH Malaria Dataset (27,588 curated medical images)   │  │
-│  │   ├─ Nested ZIP extraction pipeline                    │  │
-│  │   └─ TFRecord caching (16 shards, GZIP compression)   │  │
-│  │                                                        │  │
-│  │ • Synthetic Field-Ready Dataset (medical augmentation) │  │
-│  │   ├─ albumentations-based transforms                  │  │
-│  │   └─ CSV-based label management                       │  │
-│  │                                                        │  │
-│  │ • Data Pipeline Optimizations                         │  │
-│  │   ├─ AUTOTUNE batch prefetching                      │  │
-│  │   ├─ Distributed data loading                        │  │
-│  │   └─ In-memory caching for rapid iteration           │  │
-│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │ • NIH Malaria Dataset (27,588 curated medical images)    │    │
+│  │   ├─ Nested ZIP extraction pipeline                      │    │
+│  │   └─ TFRecord caching (16 shards, GZIP compression)      │    │
+│  │                                                          │    │
+│  │ • Synthetic Field-Ready Dataset (medical augmentation)   │    │
+│  │   ├─ albumentations-based transforms                     │    │
+│  │   └─ CSV-based label management                          │    │
+│  │                                                          │    │
+│  │ • Data Pipeline Optimizations                            │    │
+│  │   ├─ AUTOTUNE batch prefetching                          │    │
+│  │   ├─ Distributed data loading                            │    │
+│  │   └─ In-memory caching for rapid iteration               │    │
+│  └──────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -643,13 +643,11 @@ For detailed information on specific topics:
 
 ## 📄 License
 
-This project is maintained by [Your Name/Organization]. Please see LICENSE file for details.
+This project is maintained by Jacob Frusher. Please see LICENSE file for details.
 
 ---
 
 ## ✨ Acknowledgments
-
-Built with precision for production deployment. Every line of code reflects enterprise-grade software engineering standards.
 
 - NIH Malaria Dataset: Research community reference
 - Flutter: Google's cross-platform framework
@@ -657,8 +655,6 @@ Built with precision for production deployment. Every line of code reflects ente
 - PyTorch: Facebook's ML research framework
 
 ---
-
-**Status**: ✅ Production Ready | 🚀 Actively Maintained | 📈 Fully Documented
 
 *Last Updated: May 2026 | Repository: [github.com/JFrusher/MALLI](https://github.com/JFrusher/MALLI)*
 

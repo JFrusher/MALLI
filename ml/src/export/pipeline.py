@@ -66,7 +66,7 @@ class TFLiteExporter:
         # Extract input/output shapes from model
         input_shape = tuple(model.input_shape[1:])
         output_shape = tuple(model.output_shape[1:])
-        
+
         def representative_dataset_generator():
             """Yield samples for post-training integer quantization."""
             for batch in train_ds.take(representative_batches):
@@ -74,9 +74,21 @@ class TFLiteExporter:
                 for i in range(images.shape[0]):
                     sample = tf.expand_dims(images[i], axis=0).numpy().astype(np.float32)
                     yield [sample]
-        
-        # Convert and quantize
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+
+        # Persist a SavedModel first so conversion doesn't rely on an internal temp dir.
+        saved_model_dir = output_path.parent / "saved_model" / f"{output_path.stem}_savedmodel"
+        saved_model_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tf.keras.models.save_model(model, str(saved_model_dir), include_optimizer=False, save_format="tf")
+            logger.info("Saved temporary SavedModel for conversion to: %s", saved_model_dir)
+        except Exception as e:
+            logger.warning("Could not persist SavedModel before conversion: %s. Proceeding with from_keras_model().", e)
+
+        # Convert and quantize using the persisted SavedModel when available
+        if saved_model_dir.exists():
+            converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
+        else:
+            converter = tf.lite.TFLiteConverter.from_keras_model(model)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         converter.representative_dataset = representative_dataset_generator
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
