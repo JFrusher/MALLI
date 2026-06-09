@@ -383,6 +383,7 @@ appveyor.yml
 # LOGS (general, not documentation)
 # ============================================================================
 
+*.lock
 *.log
 *.log.*
 debug.log
