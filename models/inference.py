@@ -18,7 +18,7 @@ import tensorflow as tf
 # Force Legacy Keras if needed for compatibility with older training sessions
 if os.environ.get("TF_USE_LEGACY_KERAS") == "1":
     try:
-        import tf_keras as keras
+        import tf_keras as keras  # type: ignore[import-not-found]
     except ImportError:
         keras = tf.keras
 else:
@@ -27,7 +27,7 @@ else:
 from .model_factory import build_mobilenetv3_small
 
 
-def load_decision_threshold(threshold_path: str | Path | None = None, default: float = 0.5) -> float:
+def load_decision_threshold(threshold_path: str | Path | None = None, default: float = 0.3) -> float:
     """Load a calibrated decision threshold from JSON if available."""
     if threshold_path is None:
         return default
@@ -95,8 +95,8 @@ def predict_image(
     model_or_path: str | Path | tf.keras.Model,
     image_path: str | Path,
     input_size: Tuple[int, int] = (224, 224),
-    threshold: float = 0.5,
-    threshold_path: str | Path | None = None,
+    threshold: float = 0.3,
+    threshold_path: str | Path | None = "models/decision_threshold.json",
 ) -> Tuple[float, int]:
     """Return (probability, predicted_label) for a single image file."""
     

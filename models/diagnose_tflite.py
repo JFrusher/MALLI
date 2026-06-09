@@ -41,6 +41,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 
 from data.data_loader import MalariaDataset
 from data.synthetic_data_loader import SyntheticFieldReadyDataset
+from models.inference import load_decision_threshold
 
 from tensorflow.lite.python.interpreter import InterpreterWithCustomOps
 
@@ -115,7 +116,12 @@ def _run_inference_on_batch(interp: tf.lite.Interpreter, batch_images: np.ndarra
     return raw_out
 
 
-def _evaluate_tflite_on_dataset(interp: tf.lite.Interpreter, dataset: tf.data.Dataset, dataset_name: str) -> dict[str, Any]:
+def _evaluate_tflite_on_dataset(
+    interp: tf.lite.Interpreter,
+    dataset: tf.data.Dataset,
+    dataset_name: str,
+    threshold: float,
+) -> dict[str, Any]:
     y_true = []
     y_pred = []
     y_prob = []
@@ -125,7 +131,7 @@ def _evaluate_tflite_on_dataset(interp: tf.lite.Interpreter, dataset: tf.data.Da
         # images are float32 in [0,1]; interpreter expects quantized input
         batch_images = images.numpy()
         probs = _run_inference_on_batch(interp, batch_images)
-        preds = (probs >= 0.5).astype(int)
+        preds = (probs >= threshold).astype(int)
 
         y_true.extend(labels.numpy().astype(int).tolist())
         y_pred.extend(preds.tolist())
@@ -147,6 +153,7 @@ def main() -> None:
     parser.add_argument("--data-root", default="nih_data", help="Path to NIH data root")
     parser.add_argument("--synthetic-root", default="datasets/synthetic_field_ready", help="Path to synthetic dataset root")
     parser.add_argument("--synthetic-labels", default="labels.csv", help="Synthetic labels CSV name (relative to synthetic root)")
+    parser.add_argument("--threshold-path", default="models/decision_threshold.json", help="Path to the calibrated decision threshold JSON")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--zip-path", default=None)
     args = parser.parse_args()
@@ -182,8 +189,9 @@ def main() -> None:
     )
     _, synth_test_ds = synth.create_datasets()
 
-    nih_results = _evaluate_tflite_on_dataset(interp, nih_test_ds, "NIH")
-    synth_results = _evaluate_tflite_on_dataset(interp, synth_test_ds, "SYNTHETIC")
+    threshold = load_decision_threshold(args.threshold_path, default=0.3)
+    nih_results = _evaluate_tflite_on_dataset(interp, nih_test_ds, "NIH", threshold)
+    synth_results = _evaluate_tflite_on_dataset(interp, synth_test_ds, "SYNTHETIC", threshold)
 
     out = {
         "tflite": str(tflite_path),

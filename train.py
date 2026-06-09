@@ -308,8 +308,9 @@ def calibrate_decision_threshold(
     model: tf.keras.Model,
     validation_ds: tf.data.Dataset,
     output_path: Path,
+    target_recall: float = 0.95,
 ) -> dict[str, float]:
-    """Pick a deployment threshold that favors recall using the synthetic holdout."""
+    """Pick a deployment threshold that prioritizes recall using the synthetic holdout."""
 
     y_true_batches: list[np.ndarray] = []
     y_prob_batches: list[np.ndarray] = []
@@ -322,13 +323,7 @@ def calibrate_decision_threshold(
     y_true = np.concatenate(y_true_batches).astype(np.int32)
     y_prob = np.concatenate(y_prob_batches).astype(np.float32)
 
-    best = {
-        "threshold": 0.5,
-        "f2_score": -1.0,
-        "precision": 0.0,
-        "recall": 0.0,
-        "balanced_accuracy": 0.0,
-    }
+    candidates: list[dict[str, float]] = []
 
     for threshold in np.linspace(0.05, 0.95, 19):
         y_pred = (y_prob >= threshold).astype(np.int32)
@@ -345,14 +340,39 @@ def calibrate_decision_threshold(
         beta_sq = 4.0
         f2_score = (1.0 + beta_sq) * precision * recall / (beta_sq * precision + recall + tf.keras.backend.epsilon())
 
-        if f2_score > best["f2_score"] or (np.isclose(f2_score, best["f2_score"]) and recall > best["recall"]):
-            best = {
+        candidates.append(
+            {
                 "threshold": float(threshold),
                 "f2_score": float(f2_score),
                 "precision": float(precision),
                 "recall": float(recall),
                 "balanced_accuracy": float(balanced_accuracy),
             }
+        )
+
+    recall_ready = [candidate for candidate in candidates if candidate["recall"] >= target_recall]
+    if recall_ready:
+        best = min(
+            recall_ready,
+            key=lambda candidate: (
+                candidate["threshold"],
+                -candidate["precision"],
+                -candidate["f2_score"],
+            ),
+        )
+        selection_mode = f"lowest_threshold_meeting_recall>={target_recall:.2f}"
+    else:
+        best = max(
+            candidates,
+            key=lambda candidate: (
+                candidate["recall"],
+                candidate["precision"],
+                -candidate["threshold"],
+            ),
+        )
+        selection_mode = "best_available_recall"
+
+    best = {**best, "target_recall": float(target_recall), "selection_mode": selection_mode}
 
     output_path.write_text(json.dumps(best, indent=2), encoding="utf-8")
     logging.info("Calibrated decision threshold saved to %s: %s", output_path, best)

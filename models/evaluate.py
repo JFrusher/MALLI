@@ -11,6 +11,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 
 from data.data_loader import MalariaDataset
 from data.synthetic_data_loader import SyntheticFieldReadyDataset
+from models.inference import load_decision_threshold
 from models.model_factory import build_mobilenetv3_small, compile_binary_model
 
 
@@ -25,6 +26,7 @@ def _evaluate_dataset(
     model: tf.keras.Model,
     dataset: tf.data.Dataset,
     dataset_name: str,
+    threshold: float,
 ) -> dict[str, Any]:
     """Run one analysis pass and print the results."""
 
@@ -35,7 +37,7 @@ def _evaluate_dataset(
     y_prob = []
     for images, labels in dataset:
         probs = model.predict(images, verbose=0).reshape(-1)
-        preds = (probs >= 0.5).astype(int)
+        preds = (probs >= threshold).astype(int)
         y_true.extend(labels.numpy().astype(int).tolist())
         y_pred.extend(preds.tolist())
         y_prob.extend(probs.tolist())
@@ -64,6 +66,7 @@ def evaluate_weights(
     cache_dir: str | Path | None = None,
     synthetic_dataset_root: str | Path = "synthetic_field_ready",
     synthetic_labels_csv: str | Path = "labels.csv",
+    threshold_path: str | Path | None = "models/decision_threshold.json",
 ) -> dict[str, Any]:
     ds = MalariaDataset(
         dataset_root=dataset_root,
@@ -90,8 +93,9 @@ def evaluate_weights(
     _, synthetic_test_ds = synthetic_ds.create_datasets()
 
     model = load_and_compile(weights_path)
-    nih_results = _evaluate_dataset(model, nih_test_ds, "NIH")
-    synthetic_results = _evaluate_dataset(model, synthetic_test_ds, "Synthetic")
+    threshold = load_decision_threshold(threshold_path, default=0.3)
+    nih_results = _evaluate_dataset(model, nih_test_ds, "NIH", threshold)
+    synthetic_results = _evaluate_dataset(model, synthetic_test_ds, "Synthetic", threshold)
 
     return {"nih": nih_results, "synthetic": synthetic_results}
 
@@ -114,6 +118,11 @@ if __name__ == "__main__":
         default="labels.csv",
         help="Path to the synthetic labels CSV relative to the synthetic root.",
     )
+    parser.add_argument(
+        "--threshold-path",
+        default="models/decision_threshold.json",
+        help="Path to the calibrated decision threshold JSON.",
+    )
     args = parser.parse_args()
     evaluate_weights(
         args.weights,
@@ -122,4 +131,5 @@ if __name__ == "__main__":
         cache_dir=args.cache_dir,
         synthetic_dataset_root=args.synthetic_root,
         synthetic_labels_csv=args.synthetic_labels_csv,
+        threshold_path=args.threshold_path,
     )

@@ -257,6 +257,42 @@ class StainJitterTransform(A.ImageOnlyTransform):
         return stain_jitter(img)
 
 
+class MicroscopeSensorResponse(A.ImageOnlyTransform):
+    """Add mild sensor noise and white-balance drift seen in low-cost microscopes."""
+
+    def __init__(self, noise_sigma_range: Tuple[float, float] = (1.5, 4.5), always_apply: bool = False, p: float = 0.5):
+        super().__init__(always_apply=always_apply, p=p)
+        self.noise_sigma_range = noise_sigma_range
+
+    def get_params(self) -> dict:
+        return {
+            "noise_sigma": float(np.random.uniform(self.noise_sigma_range[0], self.noise_sigma_range[1])),
+            "red_gain": float(np.random.uniform(0.96, 1.04)),
+            "green_gain": float(np.random.uniform(0.98, 1.03)),
+            "blue_gain": float(np.random.uniform(0.94, 1.02)),
+            "gamma": float(np.random.uniform(0.92, 1.06)),
+        }
+
+    def apply(
+        self,
+        img: np.ndarray,
+        noise_sigma: float = 2.0,
+        red_gain: float = 1.0,
+        green_gain: float = 1.0,
+        blue_gain: float = 1.0,
+        gamma: float = 1.0,
+        **params,
+    ) -> np.ndarray:  # type: ignore[override]
+        arr = img.astype(np.float32) / 255.0
+        arr = np.clip(arr, 0.0, 1.0) ** gamma
+        arr *= np.array([red_gain, green_gain, blue_gain], dtype=np.float32)
+        arr = np.clip(arr, 0.0, 1.0)
+
+        noise = np.random.normal(0.0, noise_sigma / 255.0, size=arr.shape).astype(np.float32)
+        arr = np.clip(arr + noise, 0.0, 1.0)
+        return (arr * 255.0).astype(np.uint8)
+
+
 def get_foldscope_pipeline(image_size: Tuple[int, int] = (224, 224)) -> A.Compose:
     """Build the optical and environmental simulation pipeline.
 
@@ -266,18 +302,19 @@ def get_foldscope_pipeline(image_size: Tuple[int, int] = (224, 224)) -> A.Compos
     CurriculumAugmentor to ramp probabilities over training.
     """
 
-    chromatic = ChromaticAberrationShift(shift_range=(2, 5), p=0.85)
-    vignette = Vignetting(strength_range=(0.30, 0.60), p=0.90)
+    chromatic = ChromaticAberrationShift(shift_range=(1, 3), p=0.55)
+    vignette = Vignetting(strength_range=(0.12, 0.28), p=0.55)
     focus_blur = A.OneOf(
         [
-            A.GaussianBlur(blur_limit=(7, 13), sigma_limit=(1.5, 3.5), p=1.0),
-            A.MotionBlur(blur_limit=13, p=1.0),
-            A.GlassBlur(sigma=0.9, max_delta=5, iterations=2, mode="fast", p=1.0),
+            A.GaussianBlur(blur_limit=(3, 7), sigma_limit=(0.6, 1.8), p=1.0),
+            A.MotionBlur(blur_limit=7, p=1.0),
+            A.GlassBlur(sigma=0.45, max_delta=2, iterations=1, mode="fast", p=1.0),
         ],
-        p=0.95,
+        p=0.65,
     )
-    artifacts = DustAndBubbleArtifacts(p=0.90)
-    stain = StainJitterTransform(p=0.85)
+    artifacts = DustAndBubbleArtifacts(p=0.40)
+    stain = StainJitterTransform(p=0.70)
+    sensor = MicroscopeSensorResponse(p=0.75)
 
     pipeline = A.Compose(
         [
@@ -287,9 +324,10 @@ def get_foldscope_pipeline(image_size: Tuple[int, int] = (224, 224)) -> A.Compos
             focus_blur,
             artifacts,
             stain,
+            sensor,
         ]
     )
-    pipeline.curriculum_targets = [chromatic, vignette, focus_blur, artifacts, stain]  # type: ignore[attr-defined]
+    pipeline.curriculum_targets = [chromatic, vignette, focus_blur, artifacts, stain, sensor]  # type: ignore[attr-defined]
     return pipeline
 
 

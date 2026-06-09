@@ -121,7 +121,7 @@ class CellCounter:
         Args:
             weights_path: Path to MobileNetV3 best weights (h5 or keras format)
             threshold_path: Path to decision_threshold.json for loading calibrated
-                threshold. If None, defaults to 0.4
+                threshold. If None, defaults to 0.3
             model_input_size: Input resolution for MobileNetV3 (H, W)
             roi_size: Size of square ROI crops extracted around cell centroids
             batch_size: Batch size for MobileNetV3 inference
@@ -152,7 +152,7 @@ class CellCounter:
         )
         logger.debug("Model loaded successfully")
 
-        self.threshold = load_decision_threshold(threshold_path, default=0.4)
+        self.threshold = load_decision_threshold(threshold_path, default=0.3)
         self.model_input_size = model_input_size
         self.roi_size = roi_size
         self.batch_size = batch_size
