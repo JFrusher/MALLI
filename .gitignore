@@ -13,7 +13,8 @@ __pycache__/
 *$py.class
 .Python
 *.so
-
+*.md
+docs/GI/*
 # Distribution / packaging
 build/
 develop-eggs/
