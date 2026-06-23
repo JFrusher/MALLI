@@ -29,6 +29,7 @@ import tensorflow as tf
 
 from src.data.loaders.nih_loader import MalariaDataset
 from src.data.loaders.synthetic_loader import SyntheticFieldReadyDataset
+from src.data.loaders.smear_roi_loader import SmearROILoader
 from src.models.factory import build_mobilenetv3_small, compile_binary_model
 from src.utils.visualization import LiveDashboardCallback, launch_tensorboard
 from src.export.pipeline import ExportPipeline
@@ -87,6 +88,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "seed": 42,
         "synthetic_dataset_root": "datasets/synthetic_field_ready",
         "synthetic_labels_csv": "labels.csv",
+        "smear_dataset_root": "datasets/blood_smear",
+        "smear_labels_csv": "datasets/blood_smear/labels.csv",
+        "smear_type": "auto",
+        "smear_apply_stain_norm": True,
     },
     "model": {
         "dropout_rate": 0.2,
@@ -112,42 +117,66 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         {
             "name": "stage_1_nih_warmup",
             "dataset": "nih",
-            "epochs": 1,
+            "epochs": 5,
             "learning_rate": 1e-3,
             "train_backbone": False,
-            "early_stopping_patience": 1,
+            "early_stopping_patience": 3,
+            "description": "Phase A: head-only warmup on clean NIH single-cell images",
         },
         {
-            "name": "stage_2_nih_refine",
+            "name": "stage_2_nih_finetune",
             "dataset": "nih",
-            "epochs": 1,
+            "epochs": 10,
             "learning_rate": 2e-4,
             "train_backbone": True,
-            "early_stopping_patience": 1,
+            "early_stopping_patience": 5,
+            "description": "Phase A: full fine-tune on NIH — unfreezes backbone",
         },
         {
-            "name": "stage_3_synth_warmup",
-            "dataset": "synthetic",
-            "epochs": 6,
-            "learning_rate": 1e-4,
-            "train_backbone": False,
-            "early_stopping_patience": 2,
-        },
-        {
-            "name": "stage_4_synth_refine",
-            "dataset": "synthetic",
-            "epochs": 6,
+            "name": "stage_3_obscure_warmup",
+            "dataset": "nih",
+            "epochs": 8,
             "learning_rate": 5e-5,
             "train_backbone": True,
-            "early_stopping_patience": 2,
+            "early_stopping_patience": 4,
+            "augmentation_curriculum": True,
+            "description": "Phase B: NIH cells with ramping augmentation (0%→100% intensity)",
         },
         {
-            "name": "stage_5_synth_polish",
+            "name": "stage_4_synthetic_field",
             "dataset": "synthetic",
-            "epochs": 6,
+            "epochs": 8,
+            "learning_rate": 2e-5,
+            "train_backbone": True,
+            "early_stopping_patience": 4,
+            "description": "Phase B: synthetic field-ready images with full augmentation",
+        },
+        {
+            "name": "stage_5_smear_roi_adapt",
+            "dataset": "smear_roi",
+            "epochs": 10,
             "learning_rate": 1e-5,
+            "train_backbone": False,
+            "early_stopping_patience": 5,
+            "description": "Phase C: head-only domain adaptation on blood smear ROI patches",
+        },
+        {
+            "name": "stage_6_smear_roi_finetune",
+            "dataset": "smear_roi",
+            "epochs": 8,
+            "learning_rate": 5e-6,
+            "train_backbone": True,
+            "early_stopping_patience": 4,
+            "description": "Phase C: full fine-tune on smear ROI patches with field augmentation",
+        },
+        {
+            "name": "stage_7_joint_consolidation",
+            "dataset": "nih",
+            "epochs": 5,
+            "learning_rate": 1e-6,
             "train_backbone": True,
             "early_stopping_patience": 3,
+            "description": "Phase C: joint NIH+smear consolidation polish",
         },
     ],
     "dashboard": {
@@ -494,50 +523,84 @@ def representative_dataset_generator(
             yield [sample]
 
 
-def build_dataset_registry(config: Dict[str, Any]) -> Dict[str, tuple[tf.data.Dataset, tf.data.Dataset]]:
-    """Build NIH and synthetic dataset splits once."""
+def build_dataset_registry(
+    config: Dict[str, Any],
+    required_datasets: set[str] | None = None,
+) -> Dict[str, tuple[tf.data.Dataset, tf.data.Dataset]]:
+    """Build dataset splits for all keys referenced by the active stages.
+
+    Args:
+        config: Full training config dict.
+        required_datasets: Set of dataset keys that will actually be used.
+            If None, attempts to load all configured datasets.
+
+    Returns:
+        Dict mapping dataset key → (train_ds, val_ds).
+    """
     logger = logging.getLogger(__name__)
-    logger.info("Loading datasets...")
-    
-    nih_dataset = MalariaDataset(
-        dataset_root=config["data"]["dataset_root"],
-        image_size=tuple(config["data"]["image_size"]),
-        batch_size=config["data"]["batch_size"],
-        test_split=config["data"]["test_split"],
-        seed=config["data"]["seed"],
-        zip_path=config["data"]["zip_path"],
-        cache_dir=config["data"]["cache_dir"],
-        use_tfrecord_cache=config["data"].get("use_tfrecord_cache", True),
-        tfrecord_shards=config["data"].get("tfrecord_shards", 16),
-        rebuild_cache=config["data"].get("rebuild_cache", False),
-        extract_zip=False,
-    )
-    nih_train_ds, nih_val_ds = nih_dataset.create_datasets()
-    logger.info("✓ NIH dataset loaded")
+    logger.info("Loading datasets…")
+    datasets: dict[str, tuple[tf.data.Dataset, tf.data.Dataset]] = {}
 
-    datasets: dict[str, tuple[tf.data.Dataset, tf.data.Dataset]] = {
-        "nih": (nih_train_ds, nih_val_ds),
-    }
-
-    # Load synthetic dataset only if present and required by selected stages
-    synthetic_root = Path(config["data"].get("synthetic_dataset_root", ""))
-    labels_csv_file = config["data"].get("synthetic_labels_csv", "labels.csv")
-    labels_csv_path = synthetic_root / labels_csv_file
-    if synthetic_root.exists() and labels_csv_path.exists():
-        synthetic_dataset = SyntheticFieldReadyDataset(
-            dataset_root=str(synthetic_root),
-            labels_csv=labels_csv_file,  # Pass filename only; loader will concatenate with dataset_root
+    if required_datasets is None or "nih" in required_datasets:
+        nih_dataset = MalariaDataset(
+            dataset_root=config["data"]["dataset_root"],
             image_size=tuple(config["data"]["image_size"]),
             batch_size=config["data"]["batch_size"],
             test_split=config["data"]["test_split"],
             seed=config["data"]["seed"],
-            augment_training=True,
+            zip_path=config["data"].get("zip_path"),
+            cache_dir=config["data"].get("cache_dir"),
+            use_tfrecord_cache=config["data"].get("use_tfrecord_cache", True),
+            tfrecord_shards=config["data"].get("tfrecord_shards", 16),
+            rebuild_cache=config["data"].get("rebuild_cache", False),
+            extract_zip=False,
         )
-        synthetic_train_ds, synthetic_val_ds = synthetic_dataset.create_datasets()
-        datasets["synthetic"] = (synthetic_train_ds, synthetic_val_ds)
-        logger.info("✓ Synthetic dataset loaded")
-    else:
-        logger.warning("Synthetic dataset not found or labels CSV missing: %s", labels_csv_path)
+        nih_train_ds, nih_val_ds = nih_dataset.create_datasets()
+        datasets["nih"] = (nih_train_ds, nih_val_ds)
+        logger.info("✓ NIH dataset loaded")
+
+    if required_datasets is None or "synthetic" in required_datasets:
+        synthetic_root = Path(config["data"].get("synthetic_dataset_root", ""))
+        labels_csv_file = config["data"].get("synthetic_labels_csv", "labels.csv")
+        labels_csv_path = synthetic_root / labels_csv_file
+        if synthetic_root.exists() and labels_csv_path.exists():
+            synthetic_dataset = SyntheticFieldReadyDataset(
+                dataset_root=str(synthetic_root),
+                labels_csv=labels_csv_file,
+                image_size=tuple(config["data"]["image_size"]),
+                batch_size=config["data"]["batch_size"],
+                test_split=config["data"]["test_split"],
+                seed=config["data"]["seed"],
+                augment_training=True,
+            )
+            synthetic_train_ds, synthetic_val_ds = synthetic_dataset.create_datasets()
+            datasets["synthetic"] = (synthetic_train_ds, synthetic_val_ds)
+            logger.info("✓ Synthetic field-ready dataset loaded")
+        else:
+            logger.warning("Synthetic dataset not found or labels CSV missing: %s", labels_csv_path)
+
+    if required_datasets is None or "smear_roi" in required_datasets:
+        smear_root = Path(config["data"].get("smear_dataset_root", "datasets/blood_smear"))
+        smear_labels = Path(config["data"].get("smear_labels_csv", smear_root / "labels.csv"))
+        if smear_root.exists() and smear_labels.exists():
+            smear_loader = SmearROILoader(
+                smear_root=smear_root,
+                labels_csv=smear_labels,
+                image_size=tuple(config["data"]["image_size"]),
+                batch_size=config["data"]["batch_size"],
+                test_split=config["data"]["test_split"],
+                seed=config["data"]["seed"],
+                smear_type=config["data"].get("smear_type", "auto"),
+                apply_stain_norm=config["data"].get("smear_apply_stain_norm", True),
+            )
+            smear_train_ds, smear_val_ds = smear_loader.create_datasets()
+            datasets["smear_roi"] = (smear_train_ds, smear_val_ds)
+            logger.info("✓ Blood smear ROI dataset loaded")
+        else:
+            logger.warning(
+                "Blood smear dataset not found at '%s' or labels CSV missing: %s",
+                smear_root, smear_labels,
+            )
 
     return datasets
 
@@ -735,9 +798,12 @@ def main() -> None:
         )
         logger.info("TensorBoard launched on port %d", config["dashboard"]["port"])
 
+    # Determine which datasets are actually required by the selected stages
+    required_datasets = {stage["dataset"] for stage in config["stages"]}
+
     # Load datasets
     try:
-        datasets = build_dataset_registry(config)
+        datasets = build_dataset_registry(config, required_datasets=required_datasets)
     except Exception as e:
         logger.error("Failed to load datasets: %s", e)
         sys.exit(1)

@@ -1,24 +1,40 @@
+# M.A.L.L.I. Python dependencies — single authoritative requirements file
+# Pin minor versions; keep NumPy on 1.x (ABI-compatible with TensorFlow 2.13.x).
+# Do NOT allow NumPy 2.x — it breaks TF 2.13.
+
+# Core ML
 tensorflow==2.13.1
-tensorflow-hub==0.14.0
-typing-extensions==4.5.0
-numpy==1.24.3
-opencv-python==4.8.0.74
-Pillow==10.0.0
 tensorboard==2.13.0
-scikit-learn==1.3.0
+tensorflow-hub==0.14.0
+numpy==1.24.3
+scipy==1.10.1
+scikit-learn==1.3.2
 scikit-image==0.21.0
+
+# Image processing
+Pillow==10.4.0
+opencv-python==4.10.0.84
+
+# Augmentation
 albumentations==1.3.1
-matplotlib==3.7.2
+
+# PyTorch (CPU — for CellStacking soft-label blending only)
 torch==2.1.0
-albumentations==1.3.1
+
+# Object detection alternative (research/desktop only — not used on mobile)
 ultralytics==8.0.181
 
-# Optional: Export formats support
-# TFLite export (included in TensorFlow)
-# ONNX export - uncomment to enable
+# Type stubs
+typing-extensions==4.5.0
+
+# Visualization / analysis
+matplotlib==3.7.2
+
+# Testing
+pytest==7.4.3
+pytest-cov==4.1.0
+
+# Optional export formats (uncomment to enable):
 # tf2onnx==1.14.0
 # onnx==1.14.0
 # onnxruntime==1.16.0
-
-# CoreML export (macOS only) - uncomment to enable
-# coremltools==7.0

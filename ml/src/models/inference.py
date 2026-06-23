@@ -96,21 +96,31 @@ def predict_image(
     image_path: str | Path,
     input_size: Tuple[int, int] = (224, 224),
     threshold: float = 0.3,
-    threshold_path: str | Path | None = "models/decision_threshold.json",
+    threshold_path: str | Path | None = None,
 ) -> Tuple[float, int]:
-    """Return (probability, predicted_label) for a single image file."""
-    
-    # Avoid reloading the model for every single image in a loop
+    """Return (probability, predicted_label) for a single image file.
+
+    Args:
+        model_or_path: Pre-loaded model or path to weights file.
+        image_path: Path to the image to classify.
+        input_size: Model input size.
+        threshold: Fallback decision threshold if threshold_path is None/missing.
+        threshold_path: Path to calibration JSON (decision_threshold.json).
+            Defaults to ``{weights_dir}/decision_threshold.json`` when
+            model_or_path is a path; otherwise uses ``threshold`` directly.
+    """
     if isinstance(model_or_path, (str, Path)):
         model = load_model_with_weights(model_or_path, input_shape=(input_size[0], input_size[1], 3))
+        # Resolve threshold JSON relative to the weights file if not specified
+        if threshold_path is None:
+            threshold_path = Path(model_or_path).parent / "decision_threshold.json"
     else:
         model = model_or_path
 
     arr = _load_image(image_path, input_size)
-    # expand_dims creates the batch dimension [1, 224, 224, 3]
     probs = model.predict(np.expand_dims(arr, axis=0), verbose=0).reshape(-1)
     prob = float(probs[0])
-    
+
     threshold = load_decision_threshold(threshold_path, default=threshold)
     label = int(prob >= threshold)
     return prob, label

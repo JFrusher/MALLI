@@ -1,5 +1,0 @@
-{
-  "threshold": 0.3,
-  "target_recall": 0.95,
-  "selection_mode": "manual_recall_floor_override"
-}
